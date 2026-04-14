@@ -1,18 +1,22 @@
 <#
 .SYNOPSIS
-  Exports Microsoft Entra Conditional Access policies to JSON via Microsoft Graph PowerShell.
+  Exports Microsoft Entra Conditional Access policies to JSON via Microsoft Graph PowerShell (Beta API).
 
 .DESCRIPTION
-  Uses interactive sign-in (delegated permissions). Writes a JSON file containing CA policies.
-  Optionally includes friendly-name mappings for GUIDs referenced by policies (users, groups, apps,
-  service principals, named locations, authentication contexts, and roles where possible).
+  Uses the Microsoft Graph Beta API to capture the full policy state and all condition objects
+  (users, applications, clientAppTypes, locations, deviceStates, platforms, signInRiskLevels, etc.).
+  Writes a single aggregate JSON file with export metadata. All internal primitive arrays are sorted
+  before serialization for consistent, diff-friendly output. Microsoft-managed policies are included.
 
-  Output file defaults to entra-conditional-access.json.
+  Optionally performs GUID -> display name enrichment for objects referenced in policy conditions.
+  Optionally exports individual per-policy JSON files (duplicate DisplayName handled automatically).
+  Optionally writes a structured log file with timestamps.
 
 .NOTES
-  - This script is designed to be resilient: mapping resolution is best-effort and will never fail
-    the export if a particular GUID can't be resolved (insufficient permissions, object deleted, etc).
-  - Some CA policy fields contain non-GUID tokens (e.g., "All", "None"). These are ignored for mapping.
+  - Requires Microsoft Graph PowerShell SDK v2+ (uses Get-MgBeta* cmdlets).
+  - Mapping resolution is best-effort and will never fail the export.
+  - Non-GUID tokens in CA policy collections (e.g. "All", "None") are ignored for mapping.
+  - Microsoft-managed policies (isSystemManaged = true) are included via -All.
 #>
 
 [CmdletBinding()]
@@ -21,18 +25,37 @@ param(
   [string]$OutFile = (Join-Path -Path (Get-Location) -ChildPath "entra-conditional-access.json"),
 
   [Parameter()]
-  [ValidateSet("v1.0","beta")]
-  [string]$GraphProfile = "v1.0",
+  [string]$LogFile,
 
   [Parameter()]
-  [int]$JsonDepth = 80,
+  [int]$JsonDepth = 10,
 
   [Parameter()]
-  [switch]$IncludeDirectoryObjectMappings
+  [switch]$IncludeDirectoryObjectMappings,
+
+  [Parameter()]
+  [switch]$ExportIndividualPolicies,
+
+  [Parameter()]
+  [string]$IndividualPoliciesDir = (Join-Path -Path (Get-Location) -ChildPath "policies")
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+function Write-Log {
+  param(
+    [Parameter(Mandatory)][string]$Message,
+    [ValidateSet("INFO","WARN","ERROR")]
+    [string]$Level = "INFO"
+  )
+  $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+  $line = "[$timestamp] [$Level] $Message"
+  Write-Host $line
+  if ($LogFile) {
+    $line | Add-Content -Path $LogFile -Encoding UTF8
+  }
+}
 
 function Ensure-Module {
   param([Parameter(Mandatory)][string]$Name)
@@ -82,27 +105,104 @@ function Resolve-WithError {
   }
 }
 
+# Recursively converts Graph SDK objects to ordered hashtables, sorting primitive arrays for
+# consistent, diff-friendly JSON output. Object property order is preserved.
+function ConvertTo-SortedObject {
+  param($InputObject, [int]$Depth = 0)
+
+  if ($Depth -gt 20) { return $null }
+  if ($null -eq $InputObject) { return $null }
+
+  # Primitives: return as-is
+  if ($InputObject -is [string] -or $InputObject -is [bool] -or
+      $InputObject -is [int] -or $InputObject -is [long] -or
+      $InputObject -is [double] -or $InputObject -is [Enum] -or
+      $InputObject -is [datetime]) {
+    return $InputObject
+  }
+
+  # Arrays and lists: recurse, then sort if all items are primitive
+  if ($InputObject.GetType().IsArray -or $InputObject -is [System.Collections.IList]) {
+    $items = @($InputObject | ForEach-Object { ConvertTo-SortedObject $_ ($Depth + 1) })
+    if ($items.Count -gt 1 -and $null -ne $items[0] -and
+        ($items[0] -is [string] -or $items[0] -is [int] -or $items[0] -is [long])) {
+      return @($items | Sort-Object)
+    }
+    return $items
+  }
+
+  # Dictionaries: preserve key order, recurse into values
+  if ($InputObject -is [System.Collections.IDictionary]) {
+    $result = [ordered]@{}
+    foreach ($key in $InputObject.Keys) {
+      $result[$key] = ConvertTo-SortedObject $InputObject[$key] ($Depth + 1)
+    }
+    return $result
+  }
+
+  # PSCustomObject / typed SDK objects: convert to ordered hashtable
+  $result = [ordered]@{}
+  $props = try {
+    @($InputObject.PSObject.Properties | Where-Object { $_.MemberType -in 'NoteProperty','Property' })
+  } catch { @() }
+  foreach ($prop in $props) {
+    try {
+      $result[$prop.Name] = ConvertTo-SortedObject $prop.Value ($Depth + 1)
+    } catch {
+      $result[$prop.Name] = $null
+    }
+  }
+  return $result
+}
+
+# Returns a filesystem-safe filename, appending the policy ID when DisplayName is duplicated.
+function Get-SafeFileName {
+  param(
+    [Parameter(Mandatory)][string]$DisplayName,
+    [Parameter(Mandatory)][string]$PolicyId,
+    [Parameter(Mandatory)][System.Collections.Generic.HashSet[string]]$UsedNames
+  )
+  $safe = $DisplayName -replace '[\\/:*?"<>|]', '_'
+  $safe = $safe.Trim()
+  if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "policy" }
+
+  $candidate = $safe
+  if ($UsedNames.Contains($candidate.ToLowerInvariant())) {
+    $candidate = "${safe}_${PolicyId}"
+  }
+
+  $UsedNames.Add($candidate.ToLowerInvariant()) | Out-Null
+  return "${candidate}.json"
+}
+
 # Modules
-# (These module names match the official Graph PowerShell SDK pattern. If you installed the meta-module
-#  "Microsoft.Graph", these will still be available as submodules.)
+# Beta cmdlets for CA policies require Microsoft.Graph.Beta.Identity.SignIns (SDK v2+).
+# User/group/app resolution uses stable v1.0 cmdlets which remain available alongside beta.
 Ensure-Module -Name "Microsoft.Graph.Authentication"
-Ensure-Module -Name "Microsoft.Graph.Identity.SignIns"
+Ensure-Module -Name "Microsoft.Graph.Beta.Identity.SignIns"
 Ensure-Module -Name "Microsoft.Graph.Users"
 Ensure-Module -Name "Microsoft.Graph.Groups"
 Ensure-Module -Name "Microsoft.Graph.Applications"
 Ensure-Module -Name "Microsoft.Graph.DirectoryObjects"
 Ensure-Module -Name "Microsoft.Graph.Identity.DirectoryManagement"
 
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-Import-Module Microsoft.Graph.Identity.SignIns -ErrorAction Stop
-Import-Module Microsoft.Graph.Users -ErrorAction Stop
-Import-Module Microsoft.Graph.Groups -ErrorAction Stop
-Import-Module Microsoft.Graph.Applications -ErrorAction Stop
-Import-Module Microsoft.Graph.DirectoryObjects -ErrorAction Stop
+Import-Module Microsoft.Graph.Authentication          -ErrorAction Stop
+Import-Module Microsoft.Graph.Beta.Identity.SignIns   -ErrorAction Stop
+Import-Module Microsoft.Graph.Users                   -ErrorAction Stop
+Import-Module Microsoft.Graph.Groups                  -ErrorAction Stop
+Import-Module Microsoft.Graph.Applications            -ErrorAction Stop
+Import-Module Microsoft.Graph.DirectoryObjects        -ErrorAction Stop
 Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
 
-Write-Host "Connecting to Microsoft Graph ($GraphProfile) with interactive sign-in..."
-Select-MgProfile -Name $GraphProfile
+# Initialise log file directory if needed
+if ($LogFile) {
+  $logDir = Split-Path -Parent $LogFile
+  if ($logDir -and -not (Test-Path -Path $logDir)) {
+    New-Item -ItemType Directory -Path $logDir | Out-Null
+  }
+}
+
+Write-Log "Connecting to Microsoft Graph (Beta) with interactive sign-in..."
 
 # Delegated permissions needed.
 # Note: Some of these scopes typically require admin consent in the tenant.
@@ -118,40 +218,42 @@ Connect-MgGraph -Scopes $scopes | Out-Null
 
 try {
   $ctx = Get-MgContext
-  Write-Host "Connected. TenantId=$($ctx.TenantId) Account=$($ctx.Account)"
+  Write-Log "Connected. TenantId=$($ctx.TenantId) Account=$($ctx.Account)"
 
-  Write-Host "Fetching Conditional Access policies..."
-  $policies = Get-MgIdentityConditionalAccessPolicy -All
+  Write-Log "Fetching Conditional Access policies via Beta API (includes Microsoft-managed policies)..."
+  $policies = Get-MgBetaIdentityConditionalAccessPolicy -All
+
+  # Sort policies by DisplayName for consistent, diff-friendly output
+  $policies = @($policies | Sort-Object -Property DisplayName)
+
+  Write-Log "Retrieved $(@($policies).Count) policies."
 
   $mappings = $null
 
   if ($IncludeDirectoryObjectMappings.IsPresent) {
-    Write-Host "Collecting referenced IDs from policy conditions..."
+    Write-Log "Collecting referenced IDs from policy conditions..."
 
     # Raw ID collections (may contain GUIDs and non-GUID tokens like 'All')
-    $includeUsers = @();  $excludeUsers = @()
-    $includeGroups = @(); $excludeGroups = @()
-    $includeApps = @();   $excludeApps = @()
+    $includeUsers = @();     $excludeUsers = @()
+    $includeGroups = @();    $excludeGroups = @()
+    $includeApps = @();      $excludeApps = @()
     $includeLocations = @(); $excludeLocations = @()
     $authContextRefs = @()
-    $includeRoles = @();  $excludeRoles = @()
+    $includeRoles = @();     $excludeRoles = @()
 
     foreach ($p in $policies) {
       $c = $p.Conditions
       if ($null -eq $c) { continue }
 
-      # Users/Groups/Roles
+      # Users / Groups / Roles
       $u = $c.Users
       if ($null -ne $u) {
         Add-Ids ([ref]$includeUsers)  $u.IncludeUsers
         Add-Ids ([ref]$excludeUsers)  $u.ExcludeUsers
         Add-Ids ([ref]$includeGroups) $u.IncludeGroups
         Add-Ids ([ref]$excludeGroups) $u.ExcludeGroups
-
-        # Role collections exist in many tenants (includeRoles/excludeRoles)
-        # If not present, these will be $null and safely ignored.
-        Add-Ids ([ref]$includeRoles) $u.IncludeRoles
-        Add-Ids ([ref]$excludeRoles) $u.ExcludeRoles
+        Add-Ids ([ref]$includeRoles)  $u.IncludeRoles
+        Add-Ids ([ref]$excludeRoles)  $u.ExcludeRoles
       }
 
       # Applications
@@ -169,9 +271,7 @@ try {
         Add-Ids ([ref]$excludeLocations) $l.ExcludeLocations
       }
 
-      # Authentication contexts: model varies; we keep best-effort.
-      # Many tenants expose this under conditions.authenticationContextClassReferences or similar.
-      # We'll attempt to capture common shapes.
+      # Authentication contexts (model varies; best-effort)
       if ($null -ne $c.AuthenticationContexts) {
         Add-Ids ([ref]$authContextRefs) $c.AuthenticationContexts
       }
@@ -181,41 +281,41 @@ try {
     }
 
     # Convert raw lists to unique GUID strings only
-    $userIds  = @(Get-UniqueGuidsFromIds -Ids (@($includeUsers + $excludeUsers)) | ForEach-Object { $_.Guid })
-    $groupIds = @(Get-UniqueGuidsFromIds -Ids (@($includeGroups + $excludeGroups)) | ForEach-Object { $_.Guid })
-    $appLikeIds = @(Get-UniqueGuidsFromIds -Ids (@($includeApps + $excludeApps)) | ForEach-Object { $_.Guid })
-    $locationIds = @(Get-UniqueGuidsFromIds -Ids (@($includeLocations + $excludeLocations)) | ForEach-Object { $_.Guid })
-    $authContextIds = @(Get-UniqueGuidsFromIds -Ids ($authContextRefs) | ForEach-Object { $_.Guid })
-    $roleIds = @(Get-UniqueGuidsFromIds -Ids (@($includeRoles + $excludeRoles)) | ForEach-Object { $_.Guid })
+    $userIds        = @(Get-UniqueGuidsFromIds -Ids (@($includeUsers + $excludeUsers))         | ForEach-Object { $_.Guid })
+    $groupIds       = @(Get-UniqueGuidsFromIds -Ids (@($includeGroups + $excludeGroups))       | ForEach-Object { $_.Guid })
+    $appLikeIds     = @(Get-UniqueGuidsFromIds -Ids (@($includeApps + $excludeApps))           | ForEach-Object { $_.Guid })
+    $locationIds    = @(Get-UniqueGuidsFromIds -Ids (@($includeLocations + $excludeLocations)) | ForEach-Object { $_.Guid })
+    $authContextIds = @(Get-UniqueGuidsFromIds -Ids ($authContextRefs)                         | ForEach-Object { $_.Guid })
+    $roleIds        = @(Get-UniqueGuidsFromIds -Ids (@($includeRoles + $excludeRoles))         | ForEach-Object { $_.Guid })
 
-    # Maps we’ll emit
-    $userMap  = [ordered]@{}
-    $groupMap = [ordered]@{}
-    $applicationMap = [ordered]@{}       # application object id -> {displayName, appId}
+    # Maps we'll emit
+    $userMap             = [ordered]@{}  # user object id -> {displayName, userPrincipalName}
+    $groupMap            = [ordered]@{}  # group object id -> {displayName}
+    $applicationMap      = [ordered]@{}  # application object id -> {displayName, appId}
     $servicePrincipalMap = [ordered]@{}  # servicePrincipal object id -> {displayName, appId}
-    $namedLocationMap = [ordered]@{}     # namedLocation id -> {displayName, odataType}
-    $authContextMap = [ordered]@{}       # auth context id -> {displayName}
-    $roleMap = [ordered]@{}              # directoryRole / roleTemplate id -> {displayName, description?}
+    $namedLocationMap    = [ordered]@{}  # namedLocation id -> {displayName, odataType}
+    $authContextMap      = [ordered]@{}  # auth context id -> {displayName}
+    $roleMap             = [ordered]@{}  # directoryRole / roleTemplate id -> {displayName, description}
 
     # USERS
     if ($userIds.Count -gt 0) {
-      Write-Host "Resolving $($userIds.Count) user GUID(s)..."
+      Write-Log "Resolving $($userIds.Count) user GUID(s)..."
       foreach ($id in $userIds) {
         Resolve-WithError -Id $id `
           -Resolver { Get-MgUser -UserId $id -Property "id,displayName,userPrincipalName" -ErrorAction Stop } `
           -OnSuccess {
             param($user)
             $userMap[$user.Id] = [ordered]@{
-              displayName = $user.DisplayName
+              displayName       = $user.DisplayName
               userPrincipalName = $user.UserPrincipalName
             }
           } `
           -OnError {
             param($e)
             $userMap[$id] = [ordered]@{
-              displayName = $null
+              displayName       = $null
               userPrincipalName = $null
-              error = $e.Exception.Message
+              error             = $e.Exception.Message
             }
           }
       }
@@ -223,7 +323,7 @@ try {
 
     # GROUPS
     if ($groupIds.Count -gt 0) {
-      Write-Host "Resolving $($groupIds.Count) group GUID(s)..."
+      Write-Log "Resolving $($groupIds.Count) group GUID(s)..."
       foreach ($id in $groupIds) {
         Resolve-WithError -Id $id `
           -Resolver { Get-MgGroup -GroupId $id -Property "id,displayName" -ErrorAction Stop } `
@@ -242,7 +342,7 @@ try {
     # CA includes/excludes often reference service principal object IDs, but can vary.
     # We'll attempt ServicePrincipal first, then Application.
     if ($appLikeIds.Count -gt 0) {
-      Write-Host "Resolving $($appLikeIds.Count) application/servicePrincipal GUID(s)..."
+      Write-Log "Resolving $($appLikeIds.Count) application/servicePrincipal GUID(s)..."
       foreach ($id in $appLikeIds) {
         $resolved = $false
 
@@ -267,12 +367,12 @@ try {
       }
     }
 
-    # NAMED LOCATIONS (Conditional Access Named Locations)
+    # NAMED LOCATIONS (via Beta API for full type information)
     if ($locationIds.Count -gt 0) {
-      Write-Host "Resolving $($locationIds.Count) named location GUID(s)..."
+      Write-Log "Resolving $($locationIds.Count) named location GUID(s)..."
       foreach ($id in $locationIds) {
         try {
-          $nl = Get-MgIdentityConditionalAccessNamedLocation -ConditionalAccessNamedLocationId $id -ErrorAction Stop
+          $nl = Get-MgBetaIdentityConditionalAccessNamedLocation -ConditionalAccessNamedLocationId $id -ErrorAction Stop
 
           $odataType = $null
           try { $odataType = $nl.AdditionalProperties.'@odata.type' } catch {}
@@ -284,19 +384,19 @@ try {
         } catch {
           $namedLocationMap[$id] = [ordered]@{
             displayName = $null
-            error = $_.Exception.Message
+            error       = $_.Exception.Message
           }
         }
       }
     }
 
-    # AUTHENTICATION CONTEXTS (best-effort; cmdlet availability can vary by module/version/profile)
+    # AUTHENTICATION CONTEXTS (best-effort; via Beta API)
     if ($authContextIds.Count -gt 0) {
-      Write-Host "Resolving $($authContextIds.Count) authentication context GUID(s) (best-effort)..."
+      Write-Log "Resolving $($authContextIds.Count) authentication context GUID(s) (best-effort)..."
       foreach ($id in $authContextIds) {
         try {
-          # This cmdlet exists in many Graph SDK versions; if not, it will throw and we'll record the error.
-          $ac = Get-MgIdentityConditionalAccessAuthenticationContextClassReference -AuthenticationContextClassReferenceId $id -ErrorAction Stop
+          $ac = Get-MgBetaIdentityConditionalAccessAuthenticationContextClassReference `
+            -AuthenticationContextClassReferenceId $id -ErrorAction Stop
           $authContextMap[$ac.Id] = [ordered]@{ displayName = $ac.DisplayName }
         } catch {
           $authContextMap[$id] = [ordered]@{ displayName = $null; error = $_.Exception.Message }
@@ -305,12 +405,10 @@ try {
     }
 
     # ROLES (best-effort)
-    # Depending on tenant/API, CA may reference directory role IDs or role template IDs.
-    # We'll attempt two approaches:
-    #  1) Resolve as DirectoryRole (activated role instance)
-    #  2) Resolve as DirectoryRoleTemplate
+    # CA may reference directory role IDs or role template IDs depending on the tenant/API.
+    # We'll attempt DirectoryRole first, then DirectoryRoleTemplate.
     if ($roleIds.Count -gt 0) {
-      Write-Host "Resolving $($roleIds.Count) role GUID(s) (best-effort)..."
+      Write-Log "Resolving $($roleIds.Count) role GUID(s) (best-effort)..."
       foreach ($id in $roleIds) {
         $resolved = $false
 
@@ -333,23 +431,27 @@ try {
     }
 
     $mappings = [ordered]@{
-      users = $userMap
-      groups = $groupMap
-      applications = $applicationMap
-      servicePrincipals = $servicePrincipalMap
-      namedLocations = $namedLocationMap
+      users                  = $userMap
+      groups                 = $groupMap
+      applications           = $applicationMap
+      servicePrincipals      = $servicePrincipalMap
+      namedLocations         = $namedLocationMap
       authenticationContexts = $authContextMap
-      roles = $roleMap
+      roles                  = $roleMap
     }
   }
 
+  # Convert policy objects to ordered hashtables with sorted primitive arrays
+  Write-Log "Serializing $(@($policies).Count) policies (sorting internal arrays)..."
+  $sortedPolicies = @($policies | ForEach-Object { ConvertTo-SortedObject $_ })
+
   $export = [ordered]@{
-    exportedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-    graphProfile  = $GraphProfile
-    tenantId      = $ctx.TenantId
-    account       = $ctx.Account
-    policyCount   = @($policies).Count
-    policies      = $policies
+    exportedAtUtc           = (Get-Date).ToUniversalTime().ToString("o")
+    graphApi                = "beta"
+    tenantId                = $ctx.TenantId
+    account                 = $ctx.Account
+    policyCount             = @($policies).Count
+    policies                = $sortedPolicies
     directoryObjectMappings = $mappings
   }
 
@@ -361,12 +463,36 @@ try {
   }
 
   $json | Set-Content -Path $OutFile -Encoding UTF8
+  Write-Log "Wrote aggregate JSON ($(@($policies).Count) policies) to: $OutFile"
 
-  Write-Host "Done. Wrote $(@($policies).Count) policies to: $OutFile"
   if ($IncludeDirectoryObjectMappings.IsPresent) {
-    Write-Host "Included directory object mappings in output (users, groups, apps/SPs, locations, auth contexts, roles - best effort)."
+    Write-Log "Included directory object mappings (users, groups, apps/SPs, locations, auth contexts, roles - best effort)."
+  }
+
+  # Export individual per-policy JSON files (optional)
+  if ($ExportIndividualPolicies.IsPresent) {
+    Write-Log "Exporting individual policy files to: $IndividualPoliciesDir"
+    if (-not (Test-Path -Path $IndividualPoliciesDir)) {
+      New-Item -ItemType Directory -Path $IndividualPoliciesDir | Out-Null
+    }
+
+    $usedNames = [System.Collections.Generic.HashSet[string]]::new(
+      [System.StringComparer]::OrdinalIgnoreCase
+    )
+
+    foreach ($p in $sortedPolicies) {
+      $displayName = if ($p.DisplayName) { $p.DisplayName } elseif ($p.displayName) { $p.displayName } else { "unknown" }
+      $policyId    = if ($p.Id)          { $p.Id }          elseif ($p.id)          { $p.id }          else { [Guid]::NewGuid().ToString() }
+
+      $fileName = Get-SafeFileName -DisplayName $displayName -PolicyId $policyId -UsedNames $usedNames
+      $filePath = Join-Path -Path $IndividualPoliciesDir -ChildPath $fileName
+      $p | ConvertTo-Json -Depth $JsonDepth | Set-Content -Path $filePath -Encoding UTF8
+      Write-Log "  Written: $fileName"
+    }
+    Write-Log "Individual policy export complete ($($sortedPolicies.Count) files)."
   }
 }
 finally {
   Disconnect-MgGraph | Out-Null
+  Write-Log "Disconnected from Microsoft Graph."
 }
