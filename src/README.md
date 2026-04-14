@@ -32,13 +32,15 @@ If a referenced object can't be resolved (deleted object, insufficient permissio
 
 ## Installation
 
-If you haven't installed Graph PowerShell:
+If you haven't installed Graph PowerShell, or need to upgrade from v1:
 
 ```powershell
-Install-Module Microsoft.Graph -Scope CurrentUser
+Install-Module Microsoft.Graph -Scope CurrentUser   # fresh install
+# Update-Module Microsoft.Graph                     # upgrade from an existing v1 install
 ```
 
 > Note: This installs both stable (`Microsoft.Graph.*`) and beta (`Microsoft.Graph.Beta.*`) submodules.
+> **SDK v2 or later is required** — the script uses `Get-MgBeta*` cmdlets that do not exist in v1.
 
 ## Required delegated scopes
 
