@@ -22,7 +22,7 @@
 [CmdletBinding()]
 param(
   [Parameter()]
-  [string]$OutFile = (Join-Path -Path (Get-Location) -ChildPath "entra-conditional-access.json"),
+  [string]$OutFile,
 
   [Parameter()]
   [string]$LogFile,
@@ -38,7 +38,7 @@ param(
   [switch]$ExportIndividualPolicies,
 
   [Parameter()]
-  [string]$IndividualPoliciesDir = (Join-Path -Path (Get-Location) -ChildPath "policies")
+  [string]$IndividualPoliciesDir
 )
 
 Set-StrictMode -Version Latest
@@ -58,10 +58,20 @@ function Write-Log {
   }
 }
 
-function Ensure-Module {
-  param([Parameter(Mandatory)][string]$Name)
-  if (-not (Get-Module -ListAvailable -Name $Name)) {
+function Assert-RequiredModule {
+  param(
+    [Parameter(Mandatory)][string]$Name,
+    [Version]$MinimumVersion
+  )
+  $available = @(Get-Module -ListAvailable -Name $Name)
+  if ($available.Count -eq 0) {
     throw "Required module '$Name' is not installed. Install it with: Install-Module $Name -Scope CurrentUser"
+  }
+  if ($MinimumVersion) {
+    $highest = ($available | Sort-Object Version -Descending | Select-Object -First 1).Version
+    if ($highest -lt $MinimumVersion) {
+      throw "Module '$Name' is installed (v$highest) but v$MinimumVersion or later is required. Upgrade with: Update-Module $Name"
+    }
   }
 }
 
@@ -98,7 +108,7 @@ function Resolve-WithError {
   )
 
   try {
-    $obj = & $Resolver
+    $obj = Invoke-MgWithRetry -ScriptBlock $Resolver
     & $OnSuccess $obj
   }
   catch {
@@ -106,14 +116,47 @@ function Resolve-WithError {
   }
 }
 
+# Wraps a Graph SDK scriptblock with retry logic for HTTP 429 (throttling) responses.
+# Retries up to $MaxRetries times with exponential back-off. All other errors are re-thrown.
+function Invoke-MgWithRetry {
+  param(
+    [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+    [int]$MaxRetries = 3,
+    [int]$BaseDelaySeconds = 5
+  )
+  $attempt = 0
+  while ($true) {
+    try {
+      return (& $ScriptBlock)
+    } catch {
+      $attempt++
+      $isThrottle = ($_.Exception.Message -match '429|Too Many Requests|throttl') -or
+                    ($null -ne $_.Exception.Response -and
+                     $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::TooManyRequests)
+      if (-not $isThrottle -or $attempt -gt $MaxRetries) { throw }
+      $delay = $BaseDelaySeconds * [Math]::Pow(2, $attempt - 1)
+      Write-Log "Graph API throttled (attempt $attempt/$MaxRetries). Retrying in ${delay}s..." -Level WARN
+      Start-Sleep -Seconds $delay
+    }
+  }
+}
+
 # Recursively converts Graph SDK objects to ordered hashtables, sorting primitive arrays for
 # consistent, diff-friendly JSON output. Object property order is preserved.
+# Script-level flag so the depth-cap warning is emitted at most once per run.
+$script:_depthWarningEmitted = $false
 function ConvertTo-SortedObject {
   param($InputObject, [int]$Depth = 0)
 
   # Cap recursion at 20 (well above the practical ~6 levels of Beta CA policy objects) to guard against
   # unexpected circular or extremely deep structures in future API changes.
-  if ($Depth -gt 20) { return $null }
+  if ($Depth -gt 20) {
+    if (-not $script:_depthWarningEmitted) {
+      Write-Log "Object serialization depth exceeded 20 levels; deeper properties are omitted. Consider raising -JsonDepth if output appears truncated." -Level WARN
+      $script:_depthWarningEmitted = $true
+    }
+    return $null
+  }
   if ($null -eq $InputObject) { return $null }
 
   # Primitives: return as-is
@@ -159,8 +202,6 @@ function ConvertTo-SortedObject {
 }
 
 # Returns a filesystem-safe filename, appending the policy ID when DisplayName is duplicated.
-# Note: only the characters illegal on Windows are stripped. Reserved names (CON, PRN, AUX, etc.)
-# and leading/trailing periods are not handled; these are extremely unlikely in CA policy names.
 function Get-SafeFileName {
   param(
     [Parameter(Mandatory)][string]$DisplayName,
@@ -168,8 +209,15 @@ function Get-SafeFileName {
     [Parameter(Mandatory)][System.Collections.Generic.HashSet[string]]$UsedNames
   )
   $safe = $DisplayName -replace '[\\/:*?"<>|]', '_'
-  $safe = $safe.Trim()
+  # Strip leading/trailing whitespace and periods (periods cause issues on some filesystems)
+  $safe = $safe.Trim(' .')
   if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "policy" }
+
+  # Avoid reserved Windows device names (CON, NUL, PRN, AUX, COM0-COM9, LPT0-LPT9).
+  # Use case-insensitive match because Windows treats these names case-insensitively.
+  if ($safe -imatch '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$') {
+    $safe = "${safe}_policy"
+  }
 
   $candidate = $safe
   if ($UsedNames.Contains($candidate.ToLowerInvariant())) {
@@ -183,13 +231,13 @@ function Get-SafeFileName {
 # Modules
 # Beta cmdlets for CA policies require Microsoft.Graph.Beta.Identity.SignIns (SDK v2+).
 # User/group/app resolution uses stable v1.0 cmdlets which remain available alongside beta.
-Ensure-Module -Name "Microsoft.Graph.Authentication"
-Ensure-Module -Name "Microsoft.Graph.Beta.Identity.SignIns"
-Ensure-Module -Name "Microsoft.Graph.Users"
-Ensure-Module -Name "Microsoft.Graph.Groups"
-Ensure-Module -Name "Microsoft.Graph.Applications"
-Ensure-Module -Name "Microsoft.Graph.DirectoryObjects"
-Ensure-Module -Name "Microsoft.Graph.Identity.DirectoryManagement"
+Assert-RequiredModule -Name "Microsoft.Graph.Authentication"               -MinimumVersion "2.0"
+Assert-RequiredModule -Name "Microsoft.Graph.Beta.Identity.SignIns"        -MinimumVersion "2.0"
+Assert-RequiredModule -Name "Microsoft.Graph.Users"                        -MinimumVersion "2.0"
+Assert-RequiredModule -Name "Microsoft.Graph.Groups"                       -MinimumVersion "2.0"
+Assert-RequiredModule -Name "Microsoft.Graph.Applications"                 -MinimumVersion "2.0"
+Assert-RequiredModule -Name "Microsoft.Graph.DirectoryObjects"             -MinimumVersion "2.0"
+Assert-RequiredModule -Name "Microsoft.Graph.Identity.DirectoryManagement" -MinimumVersion "2.0"
 
 Import-Module Microsoft.Graph.Authentication          -ErrorAction Stop
 Import-Module Microsoft.Graph.Beta.Identity.SignIns   -ErrorAction Stop
@@ -207,7 +255,24 @@ if ($LogFile) {
   }
 }
 
+# Resolve default paths at runtime so they reflect the working directory when the script
+# actually runs, not when parameters were bound (which could differ in interactive sessions).
+if (-not $OutFile) {
+  $OutFile = Join-Path -Path (Get-Location) -ChildPath "entra-conditional-access.json"
+}
+if (-not $IndividualPoliciesDir) {
+  $IndividualPoliciesDir = Join-Path -Path (Get-Location) -ChildPath "policies"
+}
+
 Write-Log "Connecting to Microsoft Graph (Beta) with interactive sign-in..."
+
+# Disconnect any existing Graph session to avoid silently reusing a stale token or a
+# wrong-tenant context from a previous connection in the same PowerShell session.
+$_existingCtx = Get-MgContext
+if ($null -ne $_existingCtx) {
+  Write-Log "Existing Graph session found (TenantId=$([string]$_existingCtx.TenantId) Account=$([string]$_existingCtx.Account)). Disconnecting before reconnecting..." -Level WARN
+  Disconnect-MgGraph | Out-Null
+}
 
 # Delegated permissions needed.
 # Note: Some of these scopes typically require admin consent in the tenant.
@@ -223,7 +288,17 @@ Connect-MgGraph -Scopes $scopes | Out-Null
 
 try {
   $ctx = Get-MgContext
-  Write-Log "Connected. TenantId=$($ctx.TenantId) Account=$($ctx.Account)"
+  if ($null -eq $ctx) { throw "Get-MgContext returned null after Connect-MgGraph. Authentication may have failed." }
+  Write-Log "Connected. TenantId=$([string]$ctx.TenantId) Account=$([string]$ctx.Account)"
+
+  # Verify that all required scopes were actually granted. Admin consent may be withheld for
+  # some scopes, causing a silent partial connection that fails later with a 403.
+  $grantedScopes = @($ctx.Scopes)
+  $missingScopes = $scopes | Where-Object { $grantedScopes -notcontains $_ }
+  if ($missingScopes.Count -gt 0) {
+    throw "The following required scopes were not granted: $($missingScopes -join ', '). " +
+          "Ensure admin consent has been granted in the tenant and re-run the script."
+  }
 
   Write-Log "Fetching Conditional Access policies via Beta API (includes Microsoft-managed policies)..."
   $policies = Get-MgBetaIdentityConditionalAccessPolicy -All
@@ -353,15 +428,21 @@ try {
 
         # Try Service Principal
         try {
-          $sp = Get-MgServicePrincipal -ServicePrincipalId $id -Property "id,displayName,appId" -ErrorAction Stop
+          $sp = Invoke-MgWithRetry -ScriptBlock {
+            Get-MgServicePrincipal -ServicePrincipalId $id -Property "id,displayName,appId" -ErrorAction Stop
+          }
           $servicePrincipalMap[$sp.Id] = [ordered]@{ displayName = $sp.DisplayName; appId = $sp.AppId }
           $resolved = $true
-        } catch {}
+        } catch {
+          Write-Log "  ServicePrincipal lookup failed for $id (will try Application): $($_.Exception.Message)" -Level WARN
+        }
 
         # Try Application object
         if (-not $resolved) {
           try {
-            $app = Get-MgApplication -ApplicationId $id -Property "id,displayName,appId" -ErrorAction Stop
+            $app = Invoke-MgWithRetry -ScriptBlock {
+              Get-MgApplication -ApplicationId $id -Property "id,displayName,appId" -ErrorAction Stop
+            }
             $applicationMap[$app.Id] = [ordered]@{ displayName = $app.DisplayName; appId = $app.AppId }
             $resolved = $true
           } catch {
@@ -418,14 +499,20 @@ try {
         $resolved = $false
 
         try {
-          $dr = Get-MgDirectoryRole -DirectoryRoleId $id -Property "id,displayName,description" -ErrorAction Stop
+          $dr = Invoke-MgWithRetry -ScriptBlock {
+            Get-MgDirectoryRole -DirectoryRoleId $id -Property "id,displayName,description" -ErrorAction Stop
+          }
           $roleMap[$dr.Id] = [ordered]@{ displayName = $dr.DisplayName; description = $dr.Description }
           $resolved = $true
-        } catch {}
+        } catch {
+          Write-Log "  DirectoryRole lookup failed for $id (will try DirectoryRoleTemplate): $($_.Exception.Message)" -Level WARN
+        }
 
         if (-not $resolved) {
           try {
-            $tmpl = Get-MgDirectoryRoleTemplate -DirectoryRoleTemplateId $id -Property "id,displayName,description" -ErrorAction Stop
+            $tmpl = Invoke-MgWithRetry -ScriptBlock {
+              Get-MgDirectoryRoleTemplate -DirectoryRoleTemplateId $id -Property "id,displayName,description" -ErrorAction Stop
+            }
             $roleMap[$tmpl.Id] = [ordered]@{ displayName = $tmpl.DisplayName; description = $tmpl.Description }
             $resolved = $true
           } catch {
@@ -467,6 +554,9 @@ try {
     New-Item -ItemType Directory -Path $outDir | Out-Null
   }
 
+  if (Test-Path -Path $OutFile) {
+    Write-Log "Output file already exists and will be overwritten: $OutFile" -Level WARN
+  }
   $json | Set-Content -Path $OutFile -Encoding UTF8
   Write-Log "Wrote aggregate JSON ($(@($policies).Count) policies) to: $OutFile"
 
@@ -500,6 +590,10 @@ try {
   }
 }
 finally {
-  Disconnect-MgGraph | Out-Null
-  Write-Log "Disconnected from Microsoft Graph."
+  try {
+    Disconnect-MgGraph | Out-Null
+    Write-Log "Disconnected from Microsoft Graph."
+  } catch {
+    Write-Log "Note: Disconnect-MgGraph raised an error (session may not have been established): $($_.Exception.Message)" -Level WARN
+  }
 }

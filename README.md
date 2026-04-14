@@ -5,8 +5,9 @@ Exports Microsoft Entra Conditional Access (CA) policy configuration to JSON usi
 ## Quick start
 
 ```powershell
-# Install required modules
-Install-Module Microsoft.Graph -Scope CurrentUser
+# Install required modules (v2+ required; upgrade if you already have v1 installed)
+Install-Module Microsoft.Graph -Scope CurrentUser   # fresh install
+# Update-Module Microsoft.Graph                     # upgrade from an existing v1 install
 
 # Run export (v1.0 profile, default output entra-conditional-access.json)
 .\src\Export-EntraConditionalAccess.ps1
