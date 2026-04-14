@@ -28,6 +28,7 @@ param(
   [string]$LogFile,
 
   [Parameter()]
+  # Depth 10 accommodates Beta CA policy nesting (conditions > sub-conditions ~5-6 levels); increase if truncation occurs.
   [int]$JsonDepth = 10,
 
   [Parameter()]
@@ -110,6 +111,8 @@ function Resolve-WithError {
 function ConvertTo-SortedObject {
   param($InputObject, [int]$Depth = 0)
 
+  # Cap recursion at 20 (well above the practical ~6 levels of Beta CA policy objects) to guard against
+  # unexpected circular or extremely deep structures in future API changes.
   if ($Depth -gt 20) { return $null }
   if ($null -eq $InputObject) { return $null }
 
@@ -156,6 +159,8 @@ function ConvertTo-SortedObject {
 }
 
 # Returns a filesystem-safe filename, appending the policy ID when DisplayName is duplicated.
+# Note: only the characters illegal on Windows are stripped. Reserved names (CON, PRN, AUX, etc.)
+# and leading/trailing periods are not handled; these are extremely unlikely in CA policy names.
 function Get-SafeFileName {
   param(
     [Parameter(Mandatory)][string]$DisplayName,
@@ -481,6 +486,8 @@ try {
     )
 
     foreach ($p in $sortedPolicies) {
+      # ConvertTo-SortedObject preserves PascalCase property names from the Graph SDK objects.
+      # The camelCase fallbacks (displayName, id) guard against future SDK serialization changes.
       $displayName = if ($p.DisplayName) { $p.DisplayName } elseif ($p.displayName) { $p.displayName } else { "unknown" }
       $policyId    = if ($p.Id)          { $p.Id }          elseif ($p.id)          { $p.id }          else { [Guid]::NewGuid().ToString() }
 
