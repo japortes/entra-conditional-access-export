@@ -294,7 +294,7 @@ try {
   # Verify that all required scopes were actually granted. Admin consent may be withheld for
   # some scopes, causing a silent partial connection that fails later with a 403.
   $grantedScopes = @($ctx.Scopes)
-  $missingScopes = $scopes | Where-Object { $grantedScopes -notcontains $_ }
+  $missingScopes = @($scopes | Where-Object { $grantedScopes -notcontains $_ })
   if ($missingScopes.Count -gt 0) {
     throw "The following required scopes were not granted: $($missingScopes -join ', '). " +
           "Ensure admin consent has been granted in the tenant and re-run the script."
