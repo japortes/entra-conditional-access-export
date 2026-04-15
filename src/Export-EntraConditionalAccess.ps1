@@ -38,7 +38,15 @@ param(
   [switch]$ExportIndividualPolicies,
 
   [Parameter()]
-  [string]$IndividualPoliciesDir
+  [string]$IndividualPoliciesDir,
+
+  [Parameter()]
+  # 'Global' = commercial Azure. Other values target sovereign clouds.
+  [ValidateSet("Global","USGov","USGovDoD","China")]
+  [string]$Environment = "Global",
+
+  [Parameter()]
+  [switch]$UseDeviceAuthentication
 )
 
 Set-StrictMode -Version Latest
@@ -73,6 +81,15 @@ function Assert-RequiredModule {
       throw "Module '$Name' is installed (v$highest) but v$MinimumVersion or later is required. Upgrade with: Update-Module $Name"
     }
   }
+}
+
+function Import-RequiredModule {
+  param(
+    [Parameter(Mandatory)][string]$Name,
+    [Version]$MinimumVersion = "2.0"
+  )
+  Assert-RequiredModule -Name $Name -MinimumVersion $MinimumVersion
+  Import-Module $Name -ErrorAction Stop
 }
 
 function Get-UniqueGuidsFromIds {
@@ -116,13 +133,51 @@ function Resolve-WithError {
   }
 }
 
-# Wraps a Graph SDK scriptblock with retry logic for HTTP 429 (throttling) responses.
-# Retries up to $MaxRetries times with exponential back-off. All other errors are re-thrown.
+# Returns the number of seconds to wait before retrying, honouring a Retry-After header
+# when present, otherwise falling back to exponential back-off.
+function Get-RetryDelaySeconds {
+  param(
+    [Parameter(Mandatory)]$ErrorRecord,
+    [int]$Attempt,
+    [int]$BaseDelaySeconds = 2
+  )
+  try {
+    $response = $ErrorRecord.Exception.Response
+    if ($null -ne $response) {
+      $retryAfter = $response.Headers.RetryAfter
+      if ($null -ne $retryAfter) {
+        if ($retryAfter.Delta) {
+          return [int][Math]::Ceiling($retryAfter.Delta.TotalSeconds)
+        }
+        if ($retryAfter.Date) {
+          $delta = $retryAfter.Date - [DateTimeOffset]::UtcNow
+          if ($delta.TotalSeconds -gt 0) {
+            return [int][Math]::Ceiling($delta.TotalSeconds)
+          }
+        }
+      }
+      $retryAfterHeaderValues = $null
+      if ($response.Headers.TryGetValues("Retry-After", [ref]$retryAfterHeaderValues)) {
+        $first = @($retryAfterHeaderValues | Select-Object -First 1)[0]
+        $seconds = 0
+        if ([int]::TryParse([string]$first, [ref]$seconds) -and $seconds -gt 0) {
+          return $seconds
+        }
+      }
+    }
+  } catch {
+    # Ignore header parsing issues; fall back to exponential back-off.
+  }
+  return [int]($BaseDelaySeconds * [Math]::Pow(2, $Attempt - 1))
+}
+
+# Wraps a Graph SDK scriptblock with retry logic for transient failures (429, 5xx).
+# Reads the server's Retry-After header when present; otherwise uses exponential back-off.
 function Invoke-MgWithRetry {
   param(
     [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-    [int]$MaxRetries = 3,
-    [int]$BaseDelaySeconds = 5
+    [int]$MaxRetries = 5,
+    [int]$BaseDelaySeconds = 2
   )
   $attempt = 0
   while ($true) {
@@ -130,12 +185,18 @@ function Invoke-MgWithRetry {
       return (& $ScriptBlock)
     } catch {
       $attempt++
-      $isThrottle = ($_.Exception.Message -match '429|Too Many Requests|throttl') -or
-                    ($null -ne $_.Exception.Response -and
-                     $_.Exception.Response.StatusCode -eq [System.Net.HttpStatusCode]::TooManyRequests)
-      if (-not $isThrottle -or $attempt -gt $MaxRetries) { throw }
-      $delay = $BaseDelaySeconds * [Math]::Pow(2, $attempt - 1)
-      Write-Log "Graph API throttled (attempt $attempt/$MaxRetries). Retrying in ${delay}s..." -Level WARN
+      $response = $null
+      try { $response = $_.Exception.Response } catch {}
+      $statusCode = $null
+      try { $statusCode = [int]$response.StatusCode } catch {}
+      $message = $_.Exception.Message
+      # 'throttl' is an intentional prefix — matches throttle/throttled/throttling.
+      $isTransient =
+        ($statusCode -in 429, 500, 502, 503, 504) -or
+        ($message -match '429|Too Many Requests|throttl|temporar|timeout|503|504|502')
+      if (-not $isTransient -or $attempt -gt $MaxRetries) { throw }
+      $delay = Get-RetryDelaySeconds -ErrorRecord $_ -Attempt $attempt -BaseDelaySeconds $BaseDelaySeconds
+      Write-Log "Graph/API transient failure (attempt $attempt/$MaxRetries). Retrying in ${delay}s..." -Level WARN
       Start-Sleep -Seconds $delay
     }
   }
@@ -145,14 +206,17 @@ function Invoke-MgWithRetry {
 # consistent, diff-friendly JSON output. Object property order is preserved.
 # Script-level flag so the depth-cap warning is emitted at most once per run.
 $script:_depthWarningEmitted = $false
+$script:_maxTraversalDepth = 20
 function ConvertTo-SortedObject {
   param($InputObject, [int]$Depth = 0)
 
-  # Cap recursion at 20 (well above the practical ~6 levels of Beta CA policy objects) to guard against
-  # unexpected circular or extremely deep structures in future API changes.
-  if ($Depth -gt 20) {
+  # Cap recursion at $script:_maxTraversalDepth (well above the practical ~6 levels of Beta CA
+  # policy objects) to guard against unexpected circular or extremely deep structures.
+  # To raise this cap, update $script:_maxTraversalDepth at the top of the script.
+  # Note: this cap is independent of -JsonDepth; raise $script:_maxTraversalDepth if needed.
+  if ($Depth -gt $script:_maxTraversalDepth) {
     if (-not $script:_depthWarningEmitted) {
-      Write-Log "Object serialization depth exceeded 20 levels; deeper properties are omitted. Consider raising -JsonDepth if output appears truncated." -Level WARN
+      Write-Log "Object traversal depth exceeded $($script:_maxTraversalDepth) levels; deeper properties are omitted by ConvertTo-SortedObject." -Level WARN
       $script:_depthWarningEmitted = $true
     }
     return $null
@@ -162,16 +226,27 @@ function ConvertTo-SortedObject {
   # Primitives: return as-is
   if ($InputObject -is [string] -or $InputObject -is [bool] -or
       $InputObject -is [int] -or $InputObject -is [long] -or
-      $InputObject -is [double] -or $InputObject -is [Enum] -or
-      $InputObject -is [datetime]) {
+      $InputObject -is [double] -or $InputObject -is [decimal] -or
+      $InputObject -is [Enum] -or $InputObject -is [datetime] -or
+      $InputObject -is [guid]) {
     return $InputObject
   }
 
   # Arrays and lists: recurse, then sort if all items are primitive
   if ($InputObject.GetType().IsArray -or $InputObject -is [System.Collections.IList]) {
     $items = @($InputObject | ForEach-Object { ConvertTo-SortedObject $_ ($Depth + 1) })
-    if ($items.Count -gt 1 -and $null -ne $items[0] -and
-        ($items[0] -is [string] -or $items[0] -is [int] -or $items[0] -is [long])) {
+    $allPrimitive = $true
+    foreach ($item in $items) {
+      if ($null -eq $item) { continue }
+      # [ValueType] covers all numeric types, bool, enum, guid, datetime, etc.
+      # This is intentionally broader than the early-return primitive list above, which uses
+      # explicit types to avoid returning arbitrary structs without conversion.
+      if (-not ($item -is [string] -or $item -is [ValueType])) {
+        $allPrimitive = $false
+        break
+      }
+    }
+    if ($items.Count -gt 1 -and $allPrimitive) {
       return @($items | Sort-Object)
     }
     return $items
@@ -206,17 +281,26 @@ function Get-SafeFileName {
   param(
     [Parameter(Mandatory)][string]$DisplayName,
     [Parameter(Mandatory)][string]$PolicyId,
-    [Parameter(Mandatory)][System.Collections.Generic.HashSet[string]]$UsedNames
+    [Parameter(Mandatory)][System.Collections.Generic.HashSet[string]]$UsedNames,
+    # 120 chars leaves room for the '_<guid>' collision suffix and '.json' extension
+    # while staying well inside common filesystem path-length limits.
+    [int]$MaxBaseLength = 120
   )
   $safe = $DisplayName -replace '[\\/:*?"<>|]', '_'
-  # Strip leading/trailing whitespace and periods (periods cause issues on some filesystems)
-  $safe = $safe.Trim(' .')
+  # Collapse multiple whitespace to a single space, then strip leading/trailing spaces and periods
+  $safe = ($safe -replace '\s+', ' ').Trim(' .')
+  # Collapse repeated underscores
+  $safe = ($safe -replace '_{2,}', '_')
   if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "policy" }
 
   # Avoid reserved Windows device names (CON, NUL, PRN, AUX, COM0-COM9, LPT0-LPT9).
-  # Use case-insensitive match because Windows treats these names case-insensitively.
   if ($safe -imatch '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])$') {
     $safe = "${safe}_policy"
+  }
+
+  # Truncate long names, keeping a clean boundary
+  if ($safe.Length -gt $MaxBaseLength) {
+    $safe = $safe.Substring(0, $MaxBaseLength).TrimEnd(' ','_','.')
   }
 
   $candidate = $safe
@@ -231,21 +315,17 @@ function Get-SafeFileName {
 # Modules
 # Beta cmdlets for CA policies require Microsoft.Graph.Beta.Identity.SignIns (SDK v2+).
 # User/group/app resolution uses stable v1.0 cmdlets which remain available alongside beta.
-Assert-RequiredModule -Name "Microsoft.Graph.Authentication"               -MinimumVersion "2.0"
-Assert-RequiredModule -Name "Microsoft.Graph.Beta.Identity.SignIns"        -MinimumVersion "2.0"
-Assert-RequiredModule -Name "Microsoft.Graph.Users"                        -MinimumVersion "2.0"
-Assert-RequiredModule -Name "Microsoft.Graph.Groups"                       -MinimumVersion "2.0"
-Assert-RequiredModule -Name "Microsoft.Graph.Applications"                 -MinimumVersion "2.0"
-Assert-RequiredModule -Name "Microsoft.Graph.DirectoryObjects"             -MinimumVersion "2.0"
-Assert-RequiredModule -Name "Microsoft.Graph.Identity.DirectoryManagement" -MinimumVersion "2.0"
+Import-RequiredModule -Name "Microsoft.Graph.Authentication"
+Import-RequiredModule -Name "Microsoft.Graph.Beta.Identity.SignIns"
 
-Import-Module Microsoft.Graph.Authentication          -ErrorAction Stop
-Import-Module Microsoft.Graph.Beta.Identity.SignIns   -ErrorAction Stop
-Import-Module Microsoft.Graph.Users                   -ErrorAction Stop
-Import-Module Microsoft.Graph.Groups                  -ErrorAction Stop
-Import-Module Microsoft.Graph.Applications            -ErrorAction Stop
-Import-Module Microsoft.Graph.DirectoryObjects        -ErrorAction Stop
-Import-Module Microsoft.Graph.Identity.DirectoryManagement -ErrorAction Stop
+# Enrichment modules are only loaded when needed to reduce startup friction.
+if ($IncludeDirectoryObjectMappings.IsPresent) {
+  Import-RequiredModule -Name "Microsoft.Graph.Users"
+  Import-RequiredModule -Name "Microsoft.Graph.Groups"
+  Import-RequiredModule -Name "Microsoft.Graph.Applications"
+  Import-RequiredModule -Name "Microsoft.Graph.DirectoryObjects"
+  Import-RequiredModule -Name "Microsoft.Graph.Identity.DirectoryManagement"
+}
 
 # Initialise log file directory if needed
 if ($LogFile) {
@@ -264,32 +344,41 @@ if (-not $IndividualPoliciesDir) {
   $IndividualPoliciesDir = Join-Path -Path (Get-Location) -ChildPath "policies"
 }
 
-Write-Log "Connecting to Microsoft Graph (Beta) with interactive sign-in..."
+Write-Log "Connecting to Microsoft Graph (Beta)..."
 
-# Disconnect any existing Graph session to avoid silently reusing a stale token or a
-# wrong-tenant context from a previous connection in the same PowerShell session.
-$_existingCtx = Get-MgContext
-if ($null -ne $_existingCtx) {
-  Write-Log "Existing Graph session found (TenantId=$([string]$_existingCtx.TenantId) Account=$([string]$_existingCtx.Account)). Disconnecting before reconnecting..." -Level WARN
-  Disconnect-MgGraph | Out-Null
+# Request only the scopes actually needed for the requested operation.
+# -ContextScope Process keeps auth scoped to this PowerShell session and avoids
+# tearing down any existing Graph connection in the caller's shell.
+$scopes = @("Policy.Read.All")
+if ($IncludeDirectoryObjectMappings.IsPresent) {
+  $scopes += @(
+    "User.Read.All",
+    "Group.Read.All",
+    "Application.Read.All",
+    "Directory.Read.All"
+  )
 }
 
-# Delegated permissions needed.
-# Note: Some of these scopes typically require admin consent in the tenant.
-$scopes = @(
-  "Policy.Read.All",
-  "User.Read.All",
-  "Group.Read.All",
-  "Application.Read.All",
-  "Directory.Read.All"
-)
+$connectParams = @{
+  Scopes       = $scopes
+  ContextScope = "Process"
+  Environment  = $Environment
+  NoWelcome    = $true
+}
 
-Connect-MgGraph -Scopes $scopes | Out-Null
+if ($UseDeviceAuthentication.IsPresent) {
+  $connectParams["UseDeviceAuthentication"] = $true
+  Write-Log "Using device code authentication."
+} else {
+  Write-Log "Using interactive authentication."
+}
+
+Connect-MgGraph @connectParams | Out-Null
 
 try {
   $ctx = Get-MgContext
   if ($null -eq $ctx) { throw "Get-MgContext returned null after Connect-MgGraph. Authentication may have failed." }
-  Write-Log "Connected. TenantId=$([string]$ctx.TenantId) Account=$([string]$ctx.Account)"
+  Write-Log "Connected. TenantId=$([string]$ctx.TenantId) Account=$([string]$ctx.Account) Environment=$Environment"
 
   # Verify that all required scopes were actually granted. Admin consent may be withheld for
   # some scopes, causing a silent partial connection that fails later with a 403.
@@ -301,7 +390,7 @@ try {
   }
 
   Write-Log "Fetching Conditional Access policies via Beta API (includes Microsoft-managed policies)..."
-  $policies = Get-MgBetaIdentityConditionalAccessPolicy -All
+  $policies = Invoke-MgWithRetry -ScriptBlock { Get-MgBetaIdentityConditionalAccessPolicy -All -ErrorAction Stop }
 
   # Sort policies by DisplayName for consistent, diff-friendly output
   $policies = @($policies | Sort-Object -Property DisplayName)
@@ -458,7 +547,9 @@ try {
       Write-Log "Resolving $($locationIds.Count) named location GUID(s)..."
       foreach ($id in $locationIds) {
         try {
-          $nl = Get-MgBetaIdentityConditionalAccessNamedLocation -ConditionalAccessNamedLocationId $id -ErrorAction Stop
+          $nl = Invoke-MgWithRetry -ScriptBlock {
+            Get-MgBetaIdentityConditionalAccessNamedLocation -ConditionalAccessNamedLocationId $id -ErrorAction Stop
+          }
 
           $odataType = $null
           try { $odataType = $nl.AdditionalProperties.'@odata.type' } catch {}
@@ -481,8 +572,10 @@ try {
       Write-Log "Resolving $($authContextIds.Count) authentication context GUID(s) (best-effort)..."
       foreach ($id in $authContextIds) {
         try {
-          $ac = Get-MgBetaIdentityConditionalAccessAuthenticationContextClassReference `
-            -AuthenticationContextClassReferenceId $id -ErrorAction Stop
+          $ac = Invoke-MgWithRetry -ScriptBlock {
+            Get-MgBetaIdentityConditionalAccessAuthenticationContextClassReference `
+              -AuthenticationContextClassReferenceId $id -ErrorAction Stop
+          }
           $authContextMap[$ac.Id] = [ordered]@{ displayName = $ac.DisplayName }
         } catch {
           $authContextMap[$id] = [ordered]@{ displayName = $null; error = $_.Exception.Message }
@@ -542,6 +635,7 @@ try {
     graphApi                = "beta"
     tenantId                = $ctx.TenantId
     account                 = $ctx.Account
+    environment             = $Environment
     policyCount             = @($policies).Count
     policies                = $sortedPolicies
     directoryObjectMappings = $mappings

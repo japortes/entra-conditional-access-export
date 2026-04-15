@@ -4,7 +4,7 @@ Exports Microsoft Entra Conditional Access (CA) policies to JSON using the Micro
 
 ## What it does
 
-- Connects to Microsoft Graph using **interactive sign-in** (delegated permissions).
+- Connects to Microsoft Graph using **interactive sign-in** or **device code** delegated auth (see `-UseDeviceAuthentication`), scoped to the current PowerShell process so it never tears down an existing Graph session in the caller's shell.
 - Uses `Get-MgBetaIdentityConditionalAccessPolicy -All` to capture the full policy state and all
   condition objects: `users`, `applications`, `clientAppTypes`, `locations`, `deviceStates`,
   `platforms`, `signInRiskLevels`, `userRiskLevels`, `guestOrExternalUserTypes`, etc.
@@ -44,9 +44,12 @@ Install-Module Microsoft.Graph -Scope CurrentUser   # fresh install
 
 ## Required delegated scopes
 
-The script connects with these delegated scopes:
+The script requests only the scopes needed for the requested operation:
 
+**Always required:**
 - `Policy.Read.All`
+
+**Additional (only when `-IncludeDirectoryObjectMappings` is used):**
 - `User.Read.All`
 - `Group.Read.All`
 - `Application.Read.All`
@@ -56,10 +59,13 @@ Some scopes commonly require **admin consent** in the tenant.
 
 ## Required modules
 
-The script checks for and imports these modules:
+The script checks for and imports these modules on every run:
 
 - `Microsoft.Graph.Authentication`
 - `Microsoft.Graph.Beta.Identity.SignIns` *(Beta — for CA policies, named locations, auth contexts)*
+
+These are only loaded when `-IncludeDirectoryObjectMappings` is used:
+
 - `Microsoft.Graph.Users`
 - `Microsoft.Graph.Groups`
 - `Microsoft.Graph.Applications`
@@ -113,6 +119,20 @@ Policies with duplicate `DisplayName` values are disambiguated by appending the 
 .\src\Export-EntraConditionalAccess.ps1 -ExportIndividualPolicies -IndividualPoliciesDir .\out\policies
 ```
 
+### Use device code authentication (e.g. headless / SSH sessions)
+
+```powershell
+.\src\Export-EntraConditionalAccess.ps1 -UseDeviceAuthentication
+```
+
+### Export for a sovereign cloud
+
+```powershell
+.\src\Export-EntraConditionalAccess.ps1 -Environment USGov
+```
+
+Supported values: `Global` (default), `USGov`, `USGovDoD`, `China`.
+
 ### All options combined
 
 ```powershell
@@ -121,7 +141,9 @@ Policies with duplicate `DisplayName` values are disambiguated by appending the 
   -LogFile .\logs\export.log `
   -IncludeDirectoryObjectMappings `
   -ExportIndividualPolicies `
-  -IndividualPoliciesDir .\out\policies
+  -IndividualPoliciesDir .\out\policies `
+  -Environment Global `
+  -UseDeviceAuthentication
 ```
 
 ## Parameters
@@ -131,9 +153,11 @@ Policies with duplicate `DisplayName` values are disambiguated by appending the 
 | `-OutFile` | string | `./entra-conditional-access.json` | Output path for the aggregate JSON file. |
 | `-LogFile` | string | *(none)* | If provided, structured log entries with UTC timestamps are appended to this file. |
 | `-JsonDepth` | int | `10` | Depth passed to `ConvertTo-Json`. Increase if you see truncated output. |
-| `-IncludeDirectoryObjectMappings` | switch | off | Resolves GUIDs in policy conditions to display names and emits a `directoryObjectMappings` section. |
+| `-IncludeDirectoryObjectMappings` | switch | off | Resolves GUIDs in policy conditions to display names and emits a `directoryObjectMappings` section. Also requests additional Graph scopes. |
 | `-ExportIndividualPolicies` | switch | off | Exports one JSON file per policy into `IndividualPoliciesDir`. |
 | `-IndividualPoliciesDir` | string | `./policies` | Directory for individual policy files (used with `-ExportIndividualPolicies`). |
+| `-Environment` | string | `Global` | Microsoft cloud environment. Accepted values: `Global`, `USGov`, `USGovDoD`, `China`. |
+| `-UseDeviceAuthentication` | switch | off | Uses device code flow instead of interactive browser sign-in. Useful in headless / SSH sessions. |
 
 ## Output format
 
@@ -145,6 +169,7 @@ The aggregate JSON file includes:
 | `graphApi` | Always `"beta"` |
 | `tenantId` | Tenant ID from the connected Graph context |
 | `account` | UPN / account used for the connection |
+| `environment` | Cloud environment used (`Global`, `USGov`, etc.) |
 | `policyCount` | Number of policies returned |
 | `policies` | Array of policy objects (sorted by `DisplayName`; internal arrays sorted) |
 | `directoryObjectMappings` | GUID → name maps (only when `-IncludeDirectoryObjectMappings` is used) |
