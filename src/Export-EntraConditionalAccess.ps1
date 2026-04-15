@@ -488,11 +488,13 @@ try {
       }
 
       # Authentication contexts (model varies; best-effort)
-      if ($null -ne $c.AuthenticationContexts) {
-        Add-Ids ([ref]$authContextRefs) $c.AuthenticationContexts
+      $authContextsProp = $c.PSObject.Properties['AuthenticationContexts']
+      if ($null -ne $authContextsProp -and $null -ne $authContextsProp.Value) {
+        Add-Ids ([ref]$authContextRefs) $authContextsProp.Value
       }
-      if ($null -ne $c.AuthenticationContextClassReferences) {
-        Add-Ids ([ref]$authContextRefs) $c.AuthenticationContextClassReferences
+      $authContextClassRefsProp = $c.PSObject.Properties['AuthenticationContextClassReferences']
+      if ($null -ne $authContextClassRefsProp -and $null -ne $authContextClassRefsProp.Value) {
+        Add-Ids ([ref]$authContextRefs) $authContextClassRefsProp.Value
       }
     }
 
