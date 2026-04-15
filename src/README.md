@@ -133,6 +133,12 @@ Policies with duplicate `DisplayName` values are disambiguated by appending the 
 
 Supported values: `Global` (default), `USGov`, `USGovDoD`, `China`.
 
+### Target a specific tenant (Tenant ID)
+
+```powershell
+.\src\Export-EntraConditionalAccess.ps1 -TenantId "<guid>"
+```
+
 ### All options combined
 
 ```powershell
@@ -157,6 +163,7 @@ Supported values: `Global` (default), `USGov`, `USGovDoD`, `China`.
 | `-ExportIndividualPolicies` | switch | off | Exports one JSON file per policy into `IndividualPoliciesDir`. |
 | `-IndividualPoliciesDir` | string | `./policies` | Directory for individual policy files (used with `-ExportIndividualPolicies`). |
 | `-Environment` | string | `Global` | Microsoft cloud environment. Accepted values: `Global`, `USGov`, `USGovDoD`, `China`. |
+| `-TenantId` | string | *(none)* | Target tenant ID (GUID). Passed to `Connect-MgGraph -TenantId`. Works with interactive auth, device code auth, and managed identity. |
 | `-UseDeviceAuthentication` | switch | off | Uses device code flow instead of interactive browser sign-in. Useful in headless / SSH sessions. |
 
 ## Output format
