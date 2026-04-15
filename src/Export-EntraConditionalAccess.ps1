@@ -420,8 +420,6 @@ if ($UseManagedIdentity.IsPresent) {
 
 Connect-MgGraph @connectParams | Out-Null
 
-$ctx      = $null
-$policies = @()
 try {
   $ctx = Get-MgContext
   if ($null -eq $ctx) { throw "Get-MgContext returned null after Connect-MgGraph. Authentication may have failed." }
@@ -735,6 +733,17 @@ try {
     }
     Write-Log "Individual policy export complete ($($sortedPolicies.Count) files)."
   }
+
+  # Return a summary object to the pipeline so callers can inspect results without parsing log output.
+  [pscustomobject]@{
+    OutFile                   = $OutFile
+    IndividualPoliciesDir     = if ($ExportIndividualPolicies.IsPresent) { $IndividualPoliciesDir } else { $null }
+    PolicyCount               = @($policies).Count
+    IncludedDirectoryMappings = $IncludeDirectoryObjectMappings.IsPresent
+    Environment               = $Environment
+    TenantId                  = [string]$ctx.TenantId
+    Account                   = [string]$ctx.Account
+  }
 }
 finally {
   try {
@@ -743,14 +752,4 @@ finally {
   } catch {
     Write-Log "Note: Disconnect-MgGraph raised an error (session may not have been established): $($_.Exception.Message)" -Level WARN
   }
-}
-
-[pscustomobject]@{
-  OutFile                   = $OutFile
-  IndividualPoliciesDir     = if ($ExportIndividualPolicies.IsPresent) { $IndividualPoliciesDir } else { $null }
-  PolicyCount               = @($policies).Count
-  IncludedDirectoryMappings = $IncludeDirectoryObjectMappings.IsPresent
-  Environment               = $Environment
-  TenantId                  = if ($ctx) { [string]$ctx.TenantId } else { $TenantId }
-  Account                   = if ($ctx) { [string]$ctx.Account } else { $null }
 }
