@@ -157,7 +157,7 @@ The managed identity must have the required Graph app roles assigned (see [Manag
 .\src\Export-EntraConditionalAccess.ps1 -UseManagedIdentity -ManagedIdentityClientId "<client-or-object-id>"
 ```
 
-Pass the **client ID** (also called the object ID) of the user-assigned managed identity.
+Pass the **client ID** (application ID) of the user-assigned managed identity. This is shown as "Client ID" on the managed identity's Overview page in the Azure portal — it is distinct from the object ID.
 `-UseManagedIdentity` and `-UseDeviceAuthentication` cannot be combined.
 
 ### Export for a sovereign cloud
@@ -211,7 +211,7 @@ Use `-WhatIf` to see which files would be written without actually writing them:
 | `-TenantId` | string | *(none)* | Target tenant ID (GUID). Passed to `Connect-MgGraph -TenantId`. Works with interactive auth, device code auth, and managed identity. |
 | `-UseDeviceAuthentication` | switch | off | Uses device code flow instead of interactive browser sign-in. Useful in headless / SSH sessions. |
 | `-UseManagedIdentity` | switch | off | Uses a managed identity (system-assigned or user-assigned) instead of delegated auth. Intended for unattended automation. Incompatible with `-UseDeviceAuthentication`. |
-| `-ManagedIdentityClientId` | string | *(none)* | Client/object ID of a **user-assigned** managed identity. Requires `-UseManagedIdentity`. Omit for system-assigned. |
+| `-ManagedIdentityClientId` | string | *(none)* | **Client ID** (application ID) of a user-assigned managed identity. Requires `-UseManagedIdentity`. Omit for system-assigned. |
 
 ## Pipeline output
 

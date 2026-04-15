@@ -22,7 +22,7 @@ Install-Module Microsoft.Graph -Scope CurrentUser   # fresh install
 # Run export using a system-assigned managed identity (unattended automation)
 .\src\Export-EntraConditionalAccess.ps1 -UseManagedIdentity
 
-# Run export using a user-assigned managed identity
+# Run export using a user-assigned managed identity (client ID shown on MI's Overview page in the portal)
 .\src\Export-EntraConditionalAccess.ps1 -UseManagedIdentity -ManagedIdentityClientId "<client-id>"
 ```
 
