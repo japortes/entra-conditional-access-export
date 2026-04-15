@@ -12,14 +12,25 @@
   Optionally exports individual per-policy JSON files (duplicate DisplayName handled automatically).
   Optionally writes a structured log file with timestamps.
 
+  Authentication options (mutually exclusive):
+    Default          – interactive browser login.
+    -UseDeviceAuthentication – device-code flow (useful in headless/SSH sessions).
+    -UseManagedIdentity      – managed identity (system- or user-assigned) for unattended automation.
+
+  Use -TenantId to target a specific tenant regardless of the chosen auth method.
+  Supports -WhatIf / -Confirm via PowerShell's ShouldProcess mechanism.
+
 .NOTES
   - Requires Microsoft Graph PowerShell SDK v2+ (uses Get-MgBeta* cmdlets).
   - Mapping resolution is best-effort and will never fail the export.
   - Non-GUID tokens in CA policy collections (e.g. "All", "None") are ignored for mapping.
   - Microsoft-managed policies (isSystemManaged = true) are included via -All.
+  - When using -UseManagedIdentity the identity must have the Policy.Read.All app role (and
+    additional roles when -IncludeDirectoryObjectMappings is specified). Delegated-scope
+    consent is not applicable and is not validated in this auth mode.
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
 param(
   [Parameter()]
   [string]$OutFile,
@@ -46,7 +57,19 @@ param(
   [string]$Environment = "Global",
 
   [Parameter()]
-  [switch]$UseDeviceAuthentication
+  [switch]$UseDeviceAuthentication,
+
+  [Parameter()]
+  [string]$TenantId,
+
+  [Parameter()]
+  # Use a managed identity (system-assigned or user-assigned) to authenticate.
+  # Incompatible with -UseDeviceAuthentication. Requires the MI to have the necessary Graph app roles.
+  [switch]$UseManagedIdentity,
+
+  [Parameter()]
+  # Object/client ID of a user-assigned managed identity. Requires -UseManagedIdentity.
+  [string]$ManagedIdentityClientId
 )
 
 Set-StrictMode -Version Latest
@@ -366,7 +389,29 @@ $connectParams = @{
   NoWelcome    = $true
 }
 
-if ($UseDeviceAuthentication.IsPresent) {
+if ($TenantId) {
+  $connectParams["TenantId"] = $TenantId
+}
+
+if ($UseManagedIdentity.IsPresent -and $UseDeviceAuthentication.IsPresent) {
+  throw "UseManagedIdentity and UseDeviceAuthentication cannot be used together."
+}
+
+if ($ManagedIdentityClientId -and -not $UseManagedIdentity.IsPresent) {
+  throw "ManagedIdentityClientId requires -UseManagedIdentity."
+}
+
+if ($UseManagedIdentity.IsPresent) {
+  # Managed identity uses app-only auth; scopes are granted as app roles, not delegated.
+  $connectParams.Remove("Scopes") | Out-Null
+  $connectParams["Identity"] = $true
+  if ($ManagedIdentityClientId) {
+    $connectParams["ClientId"] = $ManagedIdentityClientId
+    Write-Log "Using user-assigned managed identity authentication."
+  } else {
+    Write-Log "Using system-assigned managed identity authentication."
+  }
+} elseif ($UseDeviceAuthentication.IsPresent) {
   $connectParams["UseDeviceAuthentication"] = $true
   Write-Log "Using device code authentication."
 } else {
@@ -375,18 +420,22 @@ if ($UseDeviceAuthentication.IsPresent) {
 
 Connect-MgGraph @connectParams | Out-Null
 
+$ctx      = $null
+$policies = @()
 try {
   $ctx = Get-MgContext
   if ($null -eq $ctx) { throw "Get-MgContext returned null after Connect-MgGraph. Authentication may have failed." }
   Write-Log "Connected. TenantId=$([string]$ctx.TenantId) Account=$([string]$ctx.Account) Environment=$Environment"
 
-  # Verify that all required scopes were actually granted. Admin consent may be withheld for
-  # some scopes, causing a silent partial connection that fails later with a 403.
-  $grantedScopes = @($ctx.Scopes)
-  $missingScopes = @($scopes | Where-Object { $grantedScopes -notcontains $_ })
-  if ($missingScopes.Count -gt 0) {
-    throw "The following required scopes were not granted: $($missingScopes -join ', '). " +
-          "Ensure admin consent has been granted in the tenant and re-run the script."
+  # Verify that all required scopes were actually granted (delegated auth only).
+  # Managed identity uses app-only auth; $ctx.Scopes will be empty and the check does not apply.
+  if (-not $UseManagedIdentity.IsPresent) {
+    $grantedScopes = @($ctx.Scopes)
+    $missingScopes = @($scopes | Where-Object { $grantedScopes -notcontains $_ })
+    if ($missingScopes.Count -gt 0) {
+      throw "The following required scopes were not granted: $($missingScopes -join ', '). " +
+            "Ensure admin consent has been granted in the tenant and re-run the script."
+    }
   }
 
   Write-Log "Fetching Conditional Access policies via Beta API (includes Microsoft-managed policies)..."
@@ -651,8 +700,10 @@ try {
   if (Test-Path -Path $OutFile) {
     Write-Log "Output file already exists and will be overwritten: $OutFile" -Level WARN
   }
-  $json | Set-Content -Path $OutFile -Encoding UTF8
-  Write-Log "Wrote aggregate JSON ($(@($policies).Count) policies) to: $OutFile"
+  if ($PSCmdlet.ShouldProcess($OutFile, "Write aggregate Conditional Access export")) {
+    $json | Set-Content -Path $OutFile -Encoding UTF8
+    Write-Log "Wrote aggregate JSON ($(@($policies).Count) policies) to: $OutFile"
+  }
 
   if ($IncludeDirectoryObjectMappings.IsPresent) {
     Write-Log "Included directory object mappings (users, groups, apps/SPs, locations, auth contexts, roles - best effort)."
@@ -677,8 +728,10 @@ try {
 
       $fileName = Get-SafeFileName -DisplayName $displayName -PolicyId $policyId -UsedNames $usedNames
       $filePath = Join-Path -Path $IndividualPoliciesDir -ChildPath $fileName
-      $p | ConvertTo-Json -Depth $JsonDepth | Set-Content -Path $filePath -Encoding UTF8
-      Write-Log "  Written: $fileName"
+      if ($PSCmdlet.ShouldProcess($filePath, "Write individual Conditional Access policy export")) {
+        $p | ConvertTo-Json -Depth $JsonDepth | Set-Content -Path $filePath -Encoding UTF8
+        Write-Log "  Written: $fileName"
+      }
     }
     Write-Log "Individual policy export complete ($($sortedPolicies.Count) files)."
   }
@@ -690,4 +743,14 @@ finally {
   } catch {
     Write-Log "Note: Disconnect-MgGraph raised an error (session may not have been established): $($_.Exception.Message)" -Level WARN
   }
+}
+
+[pscustomobject]@{
+  OutFile                   = $OutFile
+  IndividualPoliciesDir     = if ($ExportIndividualPolicies.IsPresent) { $IndividualPoliciesDir } else { $null }
+  PolicyCount               = @($policies).Count
+  IncludedDirectoryMappings = $IncludeDirectoryObjectMappings.IsPresent
+  Environment               = $Environment
+  TenantId                  = if ($ctx) { [string]$ctx.TenantId } else { $TenantId }
+  Account                   = if ($ctx) { [string]$ctx.Account } else { $null }
 }
