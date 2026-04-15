@@ -5,10 +5,15 @@
 .DESCRIPTION
   Uses the Microsoft Graph Beta API to capture the full policy state and all condition objects
   (users, applications, clientAppTypes, locations, deviceStates, platforms, signInRiskLevels, etc.).
-  Writes a single aggregate JSON file with export metadata. All internal primitive arrays are sorted
-  before serialization for consistent, diff-friendly output. Microsoft-managed policies are included.
+  Writes a single aggregate JSON file with export metadata. All internal primitive arrays and all
+  object keys are sorted before serialization for fully consistent, diff-friendly output.
+  Microsoft-managed policies are included.
 
   Optionally performs GUID -> display name enrichment for objects referenced in policy conditions.
+  When enrichment is enabled, user and group lookups are batched via the Graph /$batch endpoint
+  (up to 20 parallel sub-requests per call) to minimise round-trips in large tenants. Application
+  and service principal lookups are similarly batched: service-principal is tried first; any IDs
+  not found there fall through to application-object lookup.
   Optionally exports individual per-policy JSON files (duplicate DisplayName handled automatically).
   Optionally writes a structured log file with timestamps.
 
@@ -28,6 +33,8 @@
   - When using -UseManagedIdentity the identity must have the Policy.Read.All app role (and
     additional roles when -IncludeDirectoryObjectMappings is specified). Delegated-scope
     consent is not applicable and is not validated in this auth mode.
+  - Graph /$batch requests use the v1.0 batch endpoint; individual resource URLs within each
+    batch still target the API version appropriate to the resource type.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -139,21 +146,32 @@ function Add-Ids {
   $Target.Value += @($Values)
 }
 
-function Resolve-WithError {
+# Safe property accessor for Graph SDK objects that may or may not expose a given property.
+function Get-OptionalPropertyValue {
   param(
-    [Parameter(Mandatory)][string]$Id,
-    [Parameter(Mandatory)][scriptblock]$Resolver,
-    [Parameter(Mandatory)][scriptblock]$OnSuccess,
-    [Parameter(Mandatory)][scriptblock]$OnError
+    [Parameter(Mandatory)]$Object,
+    [Parameter(Mandatory)][string]$PropertyName
   )
+  if ($null -eq $Object) { return $null }
+  $prop = $Object.PSObject.Properties[$PropertyName]
+  if ($null -ne $prop) { return $prop.Value }
+  return $null
+}
 
-  try {
-    $obj = Invoke-MgWithRetry -ScriptBlock $Resolver
-    & $OnSuccess $obj
+# Splits an array into consecutive sub-arrays of at most $ChunkSize elements.
+# Used to build Graph /$batch payloads (max 20 requests per batch call).
+function Split-IntoChunks {
+  param(
+    [Parameter(Mandatory)][array]$Items,
+    [int]$ChunkSize = 20
+  )
+  if ($Items.Count -eq 0) { return @() }
+  $chunks = @()
+  for ($i = 0; $i -lt $Items.Count; $i += $ChunkSize) {
+    $end = [Math]::Min($i + $ChunkSize - 1, $Items.Count - 1)
+    $chunks += ,($Items[$i..$end])
   }
-  catch {
-    & $OnError $_
-  }
+  return $chunks
 }
 
 # Returns the number of seconds to wait before retrying, honouring a Retry-After header
@@ -225,8 +243,218 @@ function Invoke-MgWithRetry {
   }
 }
 
-# Recursively converts Graph SDK objects to ordered hashtables, sorting primitive arrays for
-# consistent, diff-friendly JSON output. Object property order is preserved.
+# Returns the base Graph API URL for the connected environment, supporting sovereign clouds.
+# Falls back to the commercial endpoint when the environment lookup fails.
+function Get-GraphBaseUrl {
+  $ctx = Get-MgContext
+  if ($null -eq $ctx -or [string]::IsNullOrWhiteSpace($ctx.Environment)) {
+    return "https://graph.microsoft.com"
+  }
+  try {
+    $mgEnv = Get-MgEnvironment -Name $ctx.Environment
+    if ($null -ne $mgEnv) {
+      $graphEndpoint = $mgEnv.GraphEndpoint
+      if ([string]::IsNullOrWhiteSpace($graphEndpoint)) {
+        $graphEndpoint = $mgEnv.GraphEndpointResourceId
+      }
+      if (-not [string]::IsNullOrWhiteSpace($graphEndpoint)) {
+        return $graphEndpoint.TrimEnd('/')
+      }
+    }
+  }
+  catch {
+    # Fall back to commercial cloud endpoint.
+  }
+  return "https://graph.microsoft.com"
+}
+
+# Returns the retry delay (seconds) for a single sub-response inside a Graph /$batch reply.
+# Reads the sub-response's Retry-After header when present; otherwise exponential back-off.
+function Get-BatchSubresponseRetryDelaySeconds {
+  param(
+    [Parameter(Mandatory)]$SubResponse,
+    [int]$Attempt,
+    [int]$BaseDelaySeconds = 2
+  )
+  $headers = $SubResponse.headers
+  if ($null -ne $headers) {
+    foreach ($key in @('Retry-After', 'retry-after')) {
+      $headerValue = $headers.$key
+      if ($null -ne $headerValue) {
+        $seconds = 0
+        if ([int]::TryParse([string]$headerValue, [ref]$seconds) -and $seconds -gt 0) {
+          return $seconds
+        }
+      }
+    }
+  }
+  return [int]($BaseDelaySeconds * [Math]::Pow(2, $Attempt - 1))
+}
+
+# Sends a set of Graph requests via the /$batch endpoint (max 20 per call) with per-item
+# retry logic for transient 429/5xx sub-responses. Returns a flat array of sub-response objects.
+function Invoke-GraphBatchRequest {
+  param(
+    [Parameter(Mandatory)][array]$Requests,
+    [int]$MaxRetries = 5,
+    [int]$BaseDelaySeconds = 2
+  )
+  if ($Requests.Count -eq 0) { return @() }
+
+  $graphBaseUrl = Get-GraphBaseUrl
+  $batchUri = "$graphBaseUrl/v1.0/`$batch"
+
+  $pending = @($Requests)
+  $results = @{}
+  $attempt = 0
+
+  while ($pending.Count -gt 0) {
+    $attempt++
+    $body = @{ requests = $pending } | ConvertTo-Json -Depth 20
+    $response = Invoke-MgWithRetry -MaxRetries $MaxRetries -BaseDelaySeconds $BaseDelaySeconds -ScriptBlock {
+      Invoke-MgGraphRequest -Method POST -Uri $batchUri -Body $body -ContentType 'application/json'
+    }
+
+    $responses = @($response.responses)
+    $retryItems = New-Object System.Collections.Generic.List[object]
+    $maxDelay = 0
+
+    foreach ($r in $responses) {
+      $status = [int]$r.status
+      $requestId = [string]$r.id
+
+      if ($status -in 429, 500, 502, 503, 504) {
+        if ($attempt -gt $MaxRetries) {
+          # Exhausted retries – record the final failing response and move on.
+          $results[$requestId] = $r
+          continue
+        }
+        $delay = Get-BatchSubresponseRetryDelaySeconds -SubResponse $r -Attempt $attempt -BaseDelaySeconds $BaseDelaySeconds
+        if ($delay -gt $maxDelay) { $maxDelay = $delay }
+        $original = $pending | Where-Object { [string]$_.id -eq $requestId } | Select-Object -First 1
+        if ($null -ne $original) { $retryItems.Add($original) | Out-Null }
+      }
+      else {
+        $results[$requestId] = $r
+      }
+    }
+
+    if ($retryItems.Count -eq 0) { break }
+    Write-Log "Graph batch had $($retryItems.Count) transient sub-request failure(s) on attempt $attempt/$MaxRetries. Retrying in ${maxDelay}s..." -Level WARN
+    Start-Sleep -Seconds $maxDelay
+    $pending = @($retryItems)
+  }
+
+  return @($results.Values)
+}
+
+# Resolves an array of user or group object IDs to display-name entries via Graph /$batch.
+# Results (successes and errors) are written directly into $TargetMap keyed by object ID.
+function Resolve-DirectoryObjectsByBatch {
+  param(
+    [Parameter(Mandatory)][string[]]$Ids,
+    [Parameter(Mandatory)][ValidateSet('users','groups')][string]$ObjectType,
+    [Parameter(Mandatory)][hashtable]$TargetMap
+  )
+  if ($Ids.Count -eq 0) { return }
+
+  $select = switch ($ObjectType) {
+    'users'  { 'id,displayName,userPrincipalName' }
+    'groups' { 'id,displayName' }
+  }
+
+  foreach ($chunk in (Split-IntoChunks -Items $Ids -ChunkSize 20)) {
+    $requests = foreach ($id in $chunk) {
+      @{ id = $id; method = 'GET'; url = "/$ObjectType/$id`?\$select=$select" }
+    }
+    $responses = Invoke-GraphBatchRequest -Requests $requests
+
+    foreach ($r in $responses) {
+      $requestId = [string]$r.id
+      if ([int]$r.status -eq 200) {
+        $body = $r.body
+        if ($ObjectType -eq 'users') {
+          $TargetMap[$body.id] = [ordered]@{
+            displayName       = $body.displayName
+            userPrincipalName = $body.userPrincipalName
+          }
+        }
+        else {
+          $TargetMap[$body.id] = [ordered]@{ displayName = $body.displayName }
+        }
+      }
+      else {
+        if ($ObjectType -eq 'users') {
+          $TargetMap[$requestId] = [ordered]@{
+            displayName       = $null
+            userPrincipalName = $null
+            error             = "HTTP $($r.status)"
+          }
+        }
+        else {
+          $TargetMap[$requestId] = [ordered]@{ displayName = $null; error = "HTTP $($r.status)" }
+        }
+      }
+    }
+  }
+}
+
+# Resolves application/service-principal IDs via two-pass batching.
+# Pass 1: tries all IDs as servicePrincipal objects (the most common CA reference type).
+# Pass 2: retries any still-unresolved IDs as application objects.
+# Unresolvable IDs are recorded in $ServicePrincipalMap with an error marker.
+function Resolve-AppLikeObjectsByBatch {
+  param(
+    [Parameter(Mandatory)][string[]]$Ids,
+    [Parameter(Mandatory)][hashtable]$ApplicationMap,
+    [Parameter(Mandatory)][hashtable]$ServicePrincipalMap
+  )
+  if ($Ids.Count -eq 0) { return }
+
+  Write-Log "Resolving $($Ids.Count) application/servicePrincipal GUID(s) via Graph batch..."
+
+  # Pass 1: service principals
+  foreach ($chunk in (Split-IntoChunks -Items $Ids -ChunkSize 20)) {
+    $spRequests = foreach ($id in $chunk) {
+      @{ id = $id; method = 'GET'; url = "/servicePrincipals/$id`?\$select=id,displayName,appId" }
+    }
+    $spResponses = Invoke-GraphBatchRequest -Requests $spRequests
+    foreach ($r in $spResponses) {
+      if ([int]$r.status -eq 200) {
+        $body = $r.body
+        $ServicePrincipalMap[$body.id] = [ordered]@{ displayName = $body.displayName; appId = $body.appId }
+      }
+    }
+  }
+
+  # Pass 2: application objects for any IDs not found as service principals
+  $remainingIds = @($Ids | Where-Object { -not $ServicePrincipalMap.Contains($_) })
+  foreach ($chunk in (Split-IntoChunks -Items $remainingIds -ChunkSize 20)) {
+    $appRequests = foreach ($id in $chunk) {
+      @{ id = $id; method = 'GET'; url = "/applications/$id`?\$select=id,displayName,appId" }
+    }
+    $appResponses = Invoke-GraphBatchRequest -Requests $appRequests
+    foreach ($r in $appResponses) {
+      $requestId = [string]$r.id
+      if ([int]$r.status -eq 200) {
+        $body = $r.body
+        $ApplicationMap[$body.id] = [ordered]@{ displayName = $body.displayName; appId = $body.appId }
+      }
+      else {
+        # Neither SP nor Application lookup succeeded; record the failure in the SP map
+        # (the most common reference type in CA policies).
+        $ServicePrincipalMap[$requestId] = [ordered]@{
+          displayName = $null
+          appId       = $null
+          error       = "HTTP $($r.status)"
+        }
+      }
+    }
+  }
+}
+
+# Recursively converts Graph SDK objects to ordered hashtables, sorting primitive arrays AND all
+# object keys for fully consistent, diff-friendly JSON output across runs and SDK versions.
 # Script-level flag so the depth-cap warning is emitted at most once per run.
 $script:_depthWarningEmitted = $false
 $script:_maxTraversalDepth = 20
@@ -275,19 +503,21 @@ function ConvertTo-SortedObject {
     return $items
   }
 
-  # Dictionaries: preserve key order, recurse into values
+  # Dictionaries: sort keys for stable output, recurse into values
   if ($InputObject -is [System.Collections.IDictionary]) {
     $result = [ordered]@{}
-    foreach ($key in $InputObject.Keys) {
+    foreach ($key in ($InputObject.Keys | Sort-Object)) {
       $result[$key] = ConvertTo-SortedObject $InputObject[$key] ($Depth + 1)
     }
     return $result
   }
 
-  # PSCustomObject / typed SDK objects: convert to ordered hashtable
+  # PSCustomObject / typed SDK objects: convert to ordered hashtable with sorted property names
   $result = [ordered]@{}
   $props = try {
-    @($InputObject.PSObject.Properties | Where-Object { $_.MemberType -in 'NoteProperty','Property' })
+    @($InputObject.PSObject.Properties |
+        Where-Object { $_.MemberType -in 'NoteProperty','Property' } |
+        Sort-Object Name)
   } catch { @() }
   foreach ($prop in $props) {
     try {
@@ -488,14 +718,8 @@ try {
       }
 
       # Authentication contexts (model varies; best-effort)
-      $authContextsProperty = $c.PSObject.Properties['AuthenticationContexts']
-      if ($null -ne $authContextsProperty -and $null -ne $authContextsProperty.Value) {
-        Add-Ids ([ref]$authContextRefs) $authContextsProperty.Value
-      }
-      $authContextClassReferencesProperty = $c.PSObject.Properties['AuthenticationContextClassReferences']
-      if ($null -ne $authContextClassReferencesProperty -and $null -ne $authContextClassReferencesProperty.Value) {
-        Add-Ids ([ref]$authContextRefs) $authContextClassReferencesProperty.Value
-      }
+      Add-Ids ([ref]$authContextRefs) (Get-OptionalPropertyValue -Object $c -PropertyName 'AuthenticationContexts')
+      Add-Ids ([ref]$authContextRefs) (Get-OptionalPropertyValue -Object $c -PropertyName 'AuthenticationContextClassReferences')
     }
 
     # Convert raw lists to unique GUID strings only
@@ -517,78 +741,22 @@ try {
 
     # USERS
     if ($userIds.Count -gt 0) {
-      Write-Log "Resolving $($userIds.Count) user GUID(s)..."
-      foreach ($id in $userIds) {
-        Resolve-WithError -Id $id `
-          -Resolver { Get-MgUser -UserId $id -Property "id,displayName,userPrincipalName" -ErrorAction Stop } `
-          -OnSuccess {
-            param($user)
-            $userMap[$user.Id] = [ordered]@{
-              displayName       = $user.DisplayName
-              userPrincipalName = $user.UserPrincipalName
-            }
-          } `
-          -OnError {
-            param($e)
-            $userMap[$id] = [ordered]@{
-              displayName       = $null
-              userPrincipalName = $null
-              error             = $e.Exception.Message
-            }
-          }
-      }
+      Write-Log "Resolving $($userIds.Count) user GUID(s) via Graph batch..."
+      Resolve-DirectoryObjectsByBatch -Ids $userIds -ObjectType 'users' -TargetMap $userMap
     }
 
     # GROUPS
     if ($groupIds.Count -gt 0) {
-      Write-Log "Resolving $($groupIds.Count) group GUID(s)..."
-      foreach ($id in $groupIds) {
-        Resolve-WithError -Id $id `
-          -Resolver { Get-MgGroup -GroupId $id -Property "id,displayName" -ErrorAction Stop } `
-          -OnSuccess {
-            param($group)
-            $groupMap[$group.Id] = [ordered]@{ displayName = $group.DisplayName }
-          } `
-          -OnError {
-            param($e)
-            $groupMap[$id] = [ordered]@{ displayName = $null; error = $e.Exception.Message }
-          }
-      }
+      Write-Log "Resolving $($groupIds.Count) group GUID(s) via Graph batch..."
+      Resolve-DirectoryObjectsByBatch -Ids $groupIds -ObjectType 'groups' -TargetMap $groupMap
     }
 
     # APPLICATIONS / SERVICE PRINCIPALS
     # CA includes/excludes often reference service principal object IDs, but can vary.
-    # We'll attempt ServicePrincipal first, then Application.
+    # We batch all IDs as service principals first; remaining IDs fall through to application
+    # object lookup. See Resolve-AppLikeObjectsByBatch for full details.
     if ($appLikeIds.Count -gt 0) {
-      Write-Log "Resolving $($appLikeIds.Count) application/servicePrincipal GUID(s)..."
-      foreach ($id in $appLikeIds) {
-        $resolved = $false
-
-        # Try Service Principal
-        try {
-          $sp = Invoke-MgWithRetry -ScriptBlock {
-            Get-MgServicePrincipal -ServicePrincipalId $id -Property "id,displayName,appId" -ErrorAction Stop
-          }
-          $servicePrincipalMap[$sp.Id] = [ordered]@{ displayName = $sp.DisplayName; appId = $sp.AppId }
-          $resolved = $true
-        } catch {
-          Write-Log "  ServicePrincipal lookup failed for $id (will try Application): $($_.Exception.Message)" -Level WARN
-        }
-
-        # Try Application object
-        if (-not $resolved) {
-          try {
-            $app = Invoke-MgWithRetry -ScriptBlock {
-              Get-MgApplication -ApplicationId $id -Property "id,displayName,appId" -ErrorAction Stop
-            }
-            $applicationMap[$app.Id] = [ordered]@{ displayName = $app.DisplayName; appId = $app.AppId }
-            $resolved = $true
-          } catch {
-            # Store as service principal bucket with error (it's more commonly what CA stores)
-            $servicePrincipalMap[$id] = [ordered]@{ displayName = $null; appId = $null; error = $_.Exception.Message }
-          }
-        }
-      }
+      Resolve-AppLikeObjectsByBatch -Ids $appLikeIds -ApplicationMap $applicationMap -ServicePrincipalMap $servicePrincipalMap
     }
 
     # NAMED LOCATIONS (via Beta API for full type information)
@@ -675,8 +843,8 @@ try {
     }
   }
 
-  # Convert policy objects to ordered hashtables with sorted primitive arrays
-  Write-Log "Serializing $(@($policies).Count) policies (sorting internal arrays)..."
+  # Convert policy objects to ordered hashtables with sorted keys and sorted primitive arrays
+  Write-Log "Serializing $(@($policies).Count) policies (sorting all keys and internal arrays)..."
   $sortedPolicies = @($policies | ForEach-Object { ConvertTo-SortedObject $_ })
 
   $export = [ordered]@{
@@ -721,8 +889,8 @@ try {
     )
 
     foreach ($p in $sortedPolicies) {
-      # ConvertTo-SortedObject preserves PascalCase property names from the Graph SDK objects.
-      # The camelCase fallbacks (displayName, id) guard against future SDK serialization changes.
+      # ConvertTo-SortedObject converts SDK objects to ordered hashtables with all keys sorted.
+      # Both PascalCase (current SDK) and camelCase (potential future SDK) forms are handled.
       $displayName = if ($p.DisplayName) { $p.DisplayName } elseif ($p.displayName) { $p.displayName } else { "unknown" }
       $policyId    = if ($p.Id)          { $p.Id }          elseif ($p.id)          { $p.id }          else { [Guid]::NewGuid().ToString() }
 
