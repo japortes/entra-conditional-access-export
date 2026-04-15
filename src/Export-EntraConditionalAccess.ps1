@@ -365,7 +365,7 @@ function Resolve-DirectoryObjectsByBatch {
 
   foreach ($chunk in (Split-IntoChunks -Items $Ids -ChunkSize 20)) {
     $requests = foreach ($id in $chunk) {
-      @{ id = $id; method = 'GET'; url = "/$ObjectType/$id`?\$select=$select" }
+      @{ id = $id; method = 'GET'; url = "/$ObjectType/$id?`$select=$select" }
     }
     $responses = Invoke-GraphBatchRequest -Requests $requests
 
@@ -416,7 +416,7 @@ function Resolve-AppLikeObjectsByBatch {
   # Pass 1: service principals
   foreach ($chunk in (Split-IntoChunks -Items $Ids -ChunkSize 20)) {
     $spRequests = foreach ($id in $chunk) {
-      @{ id = $id; method = 'GET'; url = "/servicePrincipals/$id`?\$select=id,displayName,appId" }
+      @{ id = $id; method = 'GET'; url = "/servicePrincipals/$id?`$select=id,displayName,appId" }
     }
     $spResponses = Invoke-GraphBatchRequest -Requests $spRequests
     foreach ($r in $spResponses) {
@@ -431,7 +431,7 @@ function Resolve-AppLikeObjectsByBatch {
   $remainingIds = @($Ids | Where-Object { -not $ServicePrincipalMap.Contains($_) })
   foreach ($chunk in (Split-IntoChunks -Items $remainingIds -ChunkSize 20)) {
     $appRequests = foreach ($id in $chunk) {
-      @{ id = $id; method = 'GET'; url = "/applications/$id`?\$select=id,displayName,appId" }
+      @{ id = $id; method = 'GET'; url = "/applications/$id?`$select=id,displayName,appId" }
     }
     $appResponses = Invoke-GraphBatchRequest -Requests $appRequests
     foreach ($r in $appResponses) {
