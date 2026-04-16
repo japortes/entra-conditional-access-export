@@ -27,6 +27,10 @@ Exports Microsoft Entra Conditional Access (CA) policies to JSON using the Micro
 
 If a referenced object can't be resolved (deleted object, insufficient permissions, missing cmdlet, etc.), the export still completes and the mapping entry will include an error message.
 
+When `-IncludeDirectoryObjectMappings` is used the log now includes a count and a short sample of GUIDs being resolved for each category (users, groups, apps/SPs, locations, auth contexts, roles), so you can confirm which IDs were attempted without digging into the JSON.
+
+The named-location lookup automatically detects whether the installed Microsoft Graph PowerShell SDK version exposes the parameter as `-ConditionalAccessNamedLocationId` or `-NamedLocationId` and selects the correct one, avoiding parameter-name mismatch errors across SDK versions.
+
 ## Prerequisites
 
 - PowerShell 7+ recommended (Windows PowerShell 5.1 often works too)
