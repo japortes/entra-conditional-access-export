@@ -350,11 +350,13 @@ function Invoke-GraphBatchRequest {
 
 # Resolves an array of user or group object IDs to display-name entries via Graph /$batch.
 # Results (successes and errors) are written directly into $TargetMap keyed by object ID.
+# Uses [System.Collections.IDictionary] instead of [hashtable] so that [ordered]@{} callers
+# (OrderedDictionary) are passed by reference without PowerShell creating a coerced copy.
 function Resolve-DirectoryObjectsByBatch {
   param(
     [Parameter(Mandatory)][string[]]$Ids,
     [Parameter(Mandatory)][ValidateSet('users','groups')][string]$ObjectType,
-    [Parameter(Mandatory)][hashtable]$TargetMap
+    [Parameter(Mandatory)][System.Collections.IDictionary]$TargetMap
   )
   if ($Ids.Count -eq 0) { return }
 
@@ -364,35 +366,63 @@ function Resolve-DirectoryObjectsByBatch {
   }
 
   foreach ($chunk in (Split-IntoChunks -Items $Ids -ChunkSize 20)) {
+    # Use sequential numeric IDs for batch requests and keep a seq-ID -> object-GUID map so
+    # correlation works correctly even if the Graph layer normalises the request IDs on return.
+    $seqIdToGuid = @{}
+    $i = 0
     $requests = foreach ($id in $chunk) {
-      @{ id = $id; method = 'GET'; url = "/$ObjectType/${id}?`$select=$select" }
+      $i++
+      $seqId = [string]$i
+      $seqIdToGuid[$seqId] = $id
+      @{ id = $seqId; method = 'GET'; url = "/$ObjectType/${id}?`$select=$select" }
     }
     $responses = Invoke-GraphBatchRequest -Requests $requests
 
     foreach ($r in $responses) {
-      $requestId = [string]$r.id
+      $seqId = [string]$r.id
+      if (-not $seqIdToGuid.ContainsKey($seqId)) {
+        # Unexpected: batch response id doesn't match any request we sent; skip to avoid a bad map key.
+        Write-Log "  Unexpected batch response id '$seqId' not found in request map; skipping entry." -Level WARN
+        continue
+      }
+      $originalGuid = $seqIdToGuid[$seqId]
       if ([int]$r.status -eq 200) {
         $body = $r.body
+        # Key by the body's own id (canonical), falling back to the requested GUID.
+        $objectId = if ($body.id) { [string]$body.id } else { $originalGuid }
         if ($ObjectType -eq 'users') {
-          $TargetMap[$body.id] = [ordered]@{
+          $TargetMap[$objectId] = [ordered]@{
             displayName       = $body.displayName
             userPrincipalName = $body.userPrincipalName
           }
         }
         else {
-          $TargetMap[$body.id] = [ordered]@{ displayName = $body.displayName }
+          $TargetMap[$objectId] = [ordered]@{ displayName = $body.displayName }
         }
       }
       else {
         if ($ObjectType -eq 'users') {
-          $TargetMap[$requestId] = [ordered]@{
+          $TargetMap[$originalGuid] = [ordered]@{
             displayName       = $null
             userPrincipalName = $null
             error             = "HTTP $($r.status)"
           }
         }
         else {
-          $TargetMap[$requestId] = [ordered]@{ displayName = $null; error = "HTTP $($r.status)" }
+          $TargetMap[$originalGuid] = [ordered]@{ displayName = $null; error = "HTTP $($r.status)" }
+        }
+      }
+    }
+
+    # Guarantee every attempted GUID has an entry (success or error) even if the batch
+    # response omitted a sub-response (e.g. network truncation, unexpected response shape).
+    foreach ($id in $chunk) {
+      if (-not $TargetMap.Contains($id)) {
+        if ($ObjectType -eq 'users') {
+          $TargetMap[$id] = [ordered]@{ displayName = $null; userPrincipalName = $null; error = 'no-response' }
+        }
+        else {
+          $TargetMap[$id] = [ordered]@{ displayName = $null; error = 'no-response' }
         }
       }
     }
@@ -403,11 +433,13 @@ function Resolve-DirectoryObjectsByBatch {
 # Pass 1: tries all IDs as servicePrincipal objects (the most common CA reference type).
 # Pass 2: retries any still-unresolved IDs as application objects.
 # Unresolvable IDs are recorded in $ServicePrincipalMap with an error marker.
+# Uses [System.Collections.IDictionary] instead of [hashtable] so that [ordered]@{} callers
+# (OrderedDictionary) are passed by reference without PowerShell creating a coerced copy.
 function Resolve-AppLikeObjectsByBatch {
   param(
     [Parameter(Mandatory)][string[]]$Ids,
-    [Parameter(Mandatory)][hashtable]$ApplicationMap,
-    [Parameter(Mandatory)][hashtable]$ServicePrincipalMap
+    [Parameter(Mandatory)][System.Collections.IDictionary]$ApplicationMap,
+    [Parameter(Mandatory)][System.Collections.IDictionary]$ServicePrincipalMap
   )
   if ($Ids.Count -eq 0) { return }
 
@@ -415,8 +447,13 @@ function Resolve-AppLikeObjectsByBatch {
 
   # Pass 1: service principals
   foreach ($chunk in (Split-IntoChunks -Items $Ids -ChunkSize 20)) {
+    $seqIdToGuid = @{}
+    $i = 0
     $spRequests = foreach ($id in $chunk) {
-      @{ id = $id; method = 'GET'; url = "/servicePrincipals/${id}?`$select=id,displayName,appId" }
+      $i++
+      $seqId = [string]$i
+      $seqIdToGuid[$seqId] = $id
+      @{ id = $seqId; method = 'GET'; url = "/servicePrincipals/${id}?`$select=id,displayName,appId" }
     }
     $spResponses = Invoke-GraphBatchRequest -Requests $spRequests
     foreach ($r in $spResponses) {
@@ -424,18 +461,30 @@ function Resolve-AppLikeObjectsByBatch {
         $body = $r.body
         $ServicePrincipalMap[$body.id] = [ordered]@{ displayName = $body.displayName; appId = $body.appId }
       }
+      # Non-200 in pass 1: leave unrecorded; ID will fall through to pass 2 below.
     }
   }
 
   # Pass 2: application objects for any IDs not found as service principals
   $remainingIds = @($Ids | Where-Object { -not $ServicePrincipalMap.Contains($_) })
   foreach ($chunk in (Split-IntoChunks -Items $remainingIds -ChunkSize 20)) {
+    $seqIdToGuid = @{}
+    $i = 0
     $appRequests = foreach ($id in $chunk) {
-      @{ id = $id; method = 'GET'; url = "/applications/${id}?`$select=id,displayName,appId" }
+      $i++
+      $seqId = [string]$i
+      $seqIdToGuid[$seqId] = $id
+      @{ id = $seqId; method = 'GET'; url = "/applications/${id}?`$select=id,displayName,appId" }
     }
     $appResponses = Invoke-GraphBatchRequest -Requests $appRequests
     foreach ($r in $appResponses) {
-      $requestId = [string]$r.id
+      $seqId = [string]$r.id
+      if (-not $seqIdToGuid.ContainsKey($seqId)) {
+        # Unexpected: batch response id doesn't match any request we sent; skip to avoid a bad map key.
+        Write-Log "  Unexpected batch response id '$seqId' not found in request map; skipping entry." -Level WARN
+        continue
+      }
+      $originalGuid = $seqIdToGuid[$seqId]
       if ([int]$r.status -eq 200) {
         $body = $r.body
         $ApplicationMap[$body.id] = [ordered]@{ displayName = $body.displayName; appId = $body.appId }
@@ -443,12 +492,20 @@ function Resolve-AppLikeObjectsByBatch {
       else {
         # Neither SP nor Application lookup succeeded; record the failure in the SP map
         # (the most common reference type in CA policies).
-        $ServicePrincipalMap[$requestId] = [ordered]@{
+        $ServicePrincipalMap[$originalGuid] = [ordered]@{
           displayName = $null
           appId       = $null
           error       = "HTTP $($r.status)"
         }
       }
+    }
+  }
+
+  # Guarantee every attempted GUID has an entry (success or error) even if the batch
+  # response omitted a sub-response (e.g. network truncation, unexpected response shape).
+  foreach ($id in $Ids) {
+    if (-not $ServicePrincipalMap.Contains($id) -and -not $ApplicationMap.Contains($id)) {
+      $ServicePrincipalMap[$id] = [ordered]@{ displayName = $null; appId = $null; error = 'no-response' }
     }
   }
 }
@@ -741,13 +798,15 @@ try {
 
     # USERS
     if ($userIds.Count -gt 0) {
-      Write-Log "Resolving $($userIds.Count) user GUID(s) via Graph batch..."
+      $_sample = if ($userIds.Count -gt 3) { (($userIds | Select-Object -First 3) -join ', ') + ', ...' } else { $userIds -join ', ' }
+      Write-Log "Resolving $($userIds.Count) user GUID(s) via Graph batch: $_sample"
       Resolve-DirectoryObjectsByBatch -Ids $userIds -ObjectType 'users' -TargetMap $userMap
     }
 
     # GROUPS
     if ($groupIds.Count -gt 0) {
-      Write-Log "Resolving $($groupIds.Count) group GUID(s) via Graph batch..."
+      $_sample = if ($groupIds.Count -gt 3) { (($groupIds | Select-Object -First 3) -join ', ') + ', ...' } else { $groupIds -join ', ' }
+      Write-Log "Resolving $($groupIds.Count) group GUID(s) via Graph batch: $_sample"
       Resolve-DirectoryObjectsByBatch -Ids $groupIds -ObjectType 'groups' -TargetMap $groupMap
     }
 
@@ -761,11 +820,38 @@ try {
 
     # NAMED LOCATIONS (via Beta API for full type information)
     if ($locationIds.Count -gt 0) {
-      Write-Log "Resolving $($locationIds.Count) named location GUID(s)..."
+      $_sample = if ($locationIds.Count -gt 3) { (($locationIds | Select-Object -First 3) -join ', ') + ', ...' } else { $locationIds -join ', ' }
+      Write-Log "Resolving $($locationIds.Count) named location GUID(s): $_sample"
+
+      # Compatibility shim: detect the parameter name accepted by the installed module version.
+      # Older SDK versions use 'ConditionalAccessNamedLocationId'; newer versions may rename it.
+      $_nlCmd = Get-Command Get-MgBetaIdentityConditionalAccessNamedLocation -ErrorAction SilentlyContinue
+      $_nlIdParam = $null
+      if ($null -ne $_nlCmd) {
+        if ($_nlCmd.Parameters.ContainsKey('ConditionalAccessNamedLocationId')) {
+          $_nlIdParam = 'ConditionalAccessNamedLocationId'
+        } elseif ($_nlCmd.Parameters.ContainsKey('NamedLocationId')) {
+          $_nlIdParam = 'NamedLocationId'
+        }
+      }
+      if ($null -eq $_nlIdParam) {
+        Write-Log "  Unable to detect a supported parameter name for Get-MgBetaIdentityConditionalAccessNamedLocation; all named-location lookups will be skipped." -Level WARN
+      } else {
+        Write-Log "  Using named-location parameter: -$_nlIdParam"
+      }
+
       foreach ($id in $locationIds) {
+        if ($null -eq $_nlIdParam) {
+          $namedLocationMap[$id] = [ordered]@{
+            displayName = $null
+            error       = 'Could not determine parameter name for Get-MgBetaIdentityConditionalAccessNamedLocation'
+          }
+          continue
+        }
         try {
+          $nlParams = @{ $_nlIdParam = $id; ErrorAction = 'Stop' }
           $nl = Invoke-MgWithRetry -ScriptBlock {
-            Get-MgBetaIdentityConditionalAccessNamedLocation -ConditionalAccessNamedLocationId $id -ErrorAction Stop
+            Get-MgBetaIdentityConditionalAccessNamedLocation @nlParams
           }
 
           $odataType = $null
