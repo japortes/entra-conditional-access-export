@@ -16,12 +16,10 @@ Exports Microsoft Entra Conditional Access (CA) policies to JSON using the Micro
 - Policies and all internal primitive arrays are **sorted** before serialization for consistent,
   diff-friendly output.
 - Optionally performs **best-effort GUID → friendly name** resolution for objects referenced by policy conditions:
-  - users
-  - groups
-  - applications and service principals
-  - named locations
-  - authentication contexts
-  - roles (directory roles or role templates)
+  - **Users** and **groups** are resolved via the Graph `/$batch` endpoint (up to 20 requests per batch call).
+  - **Applications / service principals** are also batched in a two-pass strategy: every ID is attempted as a `servicePrincipal` object first; any IDs not found there fall through to an `application` object lookup.
+  - **Named locations**, **authentication contexts**, and **roles** are resolved individually (one request per object).
+  - **Roles**: DirectoryRole objects are attempted first. If that lookup fails (logged as `[WARN]`), the ID is retried as a DirectoryRoleTemplate. Failed lookups in both passes are recorded with an `error` field. The `[WARN]` log on a DirectoryRole miss is expected in tenants that reference role templates directly and does not indicate a problem.
 - Optionally exports **individual per-policy JSON files** with automatic duplicate `DisplayName` handling.
 - Optionally writes a **structured log file** with UTC timestamps for every operation.
 
@@ -54,6 +52,8 @@ Install-Module Microsoft.Graph -Scope CurrentUser   # fresh install
 > **Note:** Delegated scopes apply only to interactive and device code auth. When using `-UseManagedIdentity`, the identity must be granted the equivalent **app roles** directly (see [Managed identity app roles](#managed-identity-app-roles) below).
 
 The script requests only the scopes needed for the requested operation:
+
+> After connecting, the script verifies that all requested scopes were actually granted. If any scope is missing (e.g. admin consent not yet given), the script throws a descriptive error listing the missing scopes before attempting any API calls.
 
 **Always required:**
 - `Policy.Read.All`
@@ -133,7 +133,14 @@ This writes `entra-conditional-access.json` into the current directory.
 ```
 
 This creates a `policies/` subdirectory in the current directory and writes one JSON file per policy.
-Policies with duplicate `DisplayName` values are disambiguated by appending the policy GUID.
+Policy filenames are sanitised as follows:
+
+- Characters `\ / : * ? " < > |` are replaced with `_`.
+- Multiple consecutive whitespace characters are collapsed to a single space; leading/trailing spaces and periods are stripped.
+- Repeated underscores are collapsed to a single `_`.
+- Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`) have `_policy` appended.
+- Base names are truncated to **120 characters** (before the `.json` extension).
+- If the resulting name (after sanitisation) collides with an already-used filename, the policy GUID is appended: `<name>_<policyId>.json`.
 
 ### Specify the individual-policies output directory
 
@@ -158,7 +165,7 @@ The managed identity must have the required Graph app roles assigned (see [Manag
 ### Use a user-assigned managed identity
 
 ```powershell
-.\src\Export-EntraConditionalAccess.ps1 -UseManagedIdentity -ManagedIdentityClientId "<client-or-object-id>"
+.\src\Export-EntraConditionalAccess.ps1 -UseManagedIdentity -ManagedIdentityClientId "<client-id>"
 ```
 
 Pass the **client ID** (application ID) of the user-assigned managed identity. This is shown as "Client ID" on the managed identity's Overview page in the Azure portal — it is distinct from the object ID.
@@ -201,16 +208,18 @@ Use `-WhatIf` to see which files would be written without actually writing them:
 .\src\Export-EntraConditionalAccess.ps1 -ExportIndividualPolicies -WhatIf
 ```
 
+> **Note:** `-WhatIf` only suppresses file-write operations. All Graph API calls (authentication, policy retrieval, and GUID resolution) still execute normally.
+
 ## Parameters
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `-OutFile` | string | `./entra-conditional-access.json` | Output path for the aggregate JSON file. |
-| `-LogFile` | string | *(none)* | If provided, structured log entries with UTC timestamps are appended to this file. |
+| `-OutFile` | string | `./entra-conditional-access.json` | Output path for the aggregate JSON file. The parent directory is created automatically if it does not exist. |
+| `-LogFile` | string | *(none)* | If provided, structured log entries with UTC timestamps are appended to this file. The parent directory is created automatically if it does not exist. |
 | `-JsonDepth` | int | `10` | Depth passed to `ConvertTo-Json`. Increase if you see truncated output. |
 | `-IncludeDirectoryObjectMappings` | switch | off | Resolves GUIDs in policy conditions to display names and emits a `directoryObjectMappings` section. Also requests additional Graph scopes. |
 | `-ExportIndividualPolicies` | switch | off | Exports one JSON file per policy into `IndividualPoliciesDir`. |
-| `-IndividualPoliciesDir` | string | `./policies` | Directory for individual policy files (used with `-ExportIndividualPolicies`). |
+| `-IndividualPoliciesDir` | string | `./policies` | Directory for individual policy files (used with `-ExportIndividualPolicies`). Created automatically if it does not exist. |
 | `-Environment` | string | `Global` | Microsoft cloud environment. Accepted values: `Global`, `USGov`, `USGovDoD`, `China`. |
 | `-TenantId` | string | *(none)* | Target tenant ID (GUID). Passed to `Connect-MgGraph -TenantId`. Works with interactive auth, device code auth, and managed identity. |
 | `-UseDeviceAuthentication` | switch | off | Uses device code flow instead of interactive browser sign-in. Useful in headless / SSH sessions. |
@@ -251,17 +260,24 @@ The aggregate JSON file includes:
 | `environment` | Cloud environment used (`Global`, `USGov`, etc.) |
 | `policyCount` | Number of policies returned |
 | `policies` | Array of policy objects (sorted by `DisplayName`; internal arrays sorted) |
-| `directoryObjectMappings` | GUID → name maps (only when `-IncludeDirectoryObjectMappings` is used) |
+| `directoryObjectMappings` | Always present in the JSON output. Contains GUID → name maps when `-IncludeDirectoryObjectMappings` is used; `null` otherwise. `servicePrincipals`: all app-like IDs are first attempted as service-principal objects. If not found, an application-object lookup is performed. IDs that fail both passes are recorded under `servicePrincipals` (not `applications`) with an `error` field. |
 
 ## Notes / behavior details
 
 - The script uses `Get-MgBeta*` cmdlets — **Microsoft Graph PowerShell SDK v2+** is required.
   (`Select-MgProfile` is no longer used; the API tier is determined by the cmdlet prefix.)
+- The script automatically retries transient Graph API failures (HTTP 429, 5xx) with up to 5 attempts, honouring the server's `Retry-After` header when present and falling back to exponential back-off (2 s, 4 s, 8 s, …).
+- The script connects to Graph with `-ContextScope Process`, which scopes the session to the current PowerShell process. This means it will not tear down an existing Graph connection in the caller's shell, and the script's own session persists for the lifetime of the process. `Disconnect-MgGraph` is not called on exit.
+- If the aggregate output file (`-OutFile`) already exists it will be **overwritten**; the script logs a `[WARN]` message before doing so. There is no append mode — every run produces a fresh file.
+- Object traversal during pre-serialisation sorting is capped at **20 levels** (controlled by `$script:_maxTraversalDepth` in the script source). This cap is independent of `-JsonDepth`. If a one-time `[WARN]` message about traversal depth appears in your log, increase `$script:_maxTraversalDepth` in the script. In practice, Beta CA policy objects are ~5–6 levels deep, so this cap is only hit by unusually nested structures.
 - Mapping resolution is **best-effort** and will **never fail the export**.
 - Non-GUID tokens sometimes present in CA policy collections (e.g., `All`, `None`) are ignored for mapping.
+- `includeUserActions` values found in policy application conditions are intentionally excluded from GUID mapping — they are string action identifiers, not object GUIDs.
+- Authentication context IDs are collected from both the `AuthenticationContexts` and `AuthenticationContextClassReferences` properties on the `Conditions` object (the property name varies across Graph SDK versions). Duplicate IDs across both properties are deduplicated before resolution.
+- The named-location lookup automatically detects whether the installed SDK exposes the parameter as `-ConditionalAccessNamedLocationId` or `-NamedLocationId` and adapts accordingly. If neither is detected, all named-location lookups are skipped and an explanatory `[WARN]` is logged.
 - The script sets strict mode and `ErrorActionPreference = Stop`, but individual mapping lookups are
   isolated so lookup failures don't abort the export.
 - When `-ExportIndividualPolicies` is used, policies with the same `DisplayName` are disambiguated by
   appending `_<policyId>` to the filename.
 - The script supports `-WhatIf` and `-Confirm` via PowerShell's `SupportsShouldProcess` mechanism.
-  Use `-WhatIf` to preview which files would be written without actually writing any output.
+  `-WhatIf` only suppresses file-write operations. All Graph API calls (authentication, policy retrieval, and GUID resolution) still execute normally.
